@@ -1,0 +1,19 @@
+# 개인 정보 — 절대 올리지 말 것 (게임 목록, API 키, 내 PC 경로)
+GameShelf_data/
+GameTranslator/engine.json
+GameTranslator/번역설치.bat
+_backup_*/
+*.bak*
+
+# 작업용 파일 (저장소에는 안 올림)
+/GameShelf.exe
+*.zip
+게시글*
+
+# 빌드 결과물 (Releases 에 올림)
+build/
+dist/
+release/
+*.spec
+GameShelf_배포.zip
+__pycache__/
