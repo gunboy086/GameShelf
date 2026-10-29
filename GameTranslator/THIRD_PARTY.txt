@@ -1,0 +1,7 @@
+﻿GameTranslator 에 포함된 외부 프로그램 (payload 폴더)
+
+- BepInEx 5.4.22 (MIT)  https://github.com/BepInEx/BepInEx/tree/v5-lts
+  (HarmonyX, MonoMod, Mono.Cecil 포함 - 각각 MIT 라이선스)
+- XUnity.AutoTranslator 5.6.3 (MIT)  https://github.com/bbepis/XUnity.AutoTranslator
+
+라이선스 원문: 저장소의 licenses 폴더

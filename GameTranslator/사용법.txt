@@ -1,0 +1,37 @@
+﻿GameTranslator v3 사용법
+
+[처음 한 번]
+1. 이 GameTranslator 폴더를 원하는 곳에 둡니다. (예: D:\Tools\GameShelf\GameTranslator — GameShelf.exe 옆)
+2. Setup.bat 을 더블클릭합니다.
+   - 폴더 오른쪽 클릭 메뉴에 '한국어 번역 설치 (GameTranslator)' 가 추가됩니다.
+   - 이 폴더에 '번역설치.bat' 버튼 파일이 생깁니다.
+   (폴더를 옮겼거나 새 버전으로 덮어썼으면 Setup.bat 을 다시 실행)
+
+[게임마다]
+- 방법 1: 게임 폴더를 오른쪽 클릭 → '한국어 번역 설치 (GameTranslator)'
+          (Windows 11은 '더 많은 옵션 표시' 안)
+- 방법 2: '번역설치.bat' 을 게임 폴더에 복사해 넣고 더블클릭
+- 게임 본체가 한두 단계 아래 폴더(예: 本体)에 있어도 알아서 찾아 들어갑니다.
+
+[엔진별 동작]
+- Unity (Mono): BepInEx + XUnity.AutoTranslator 설치 → 원래 exe 실행하면 실시간 번역
+  · 게임 경로에 한글/일본어 폴더 이름이 있으면 동작하지 않습니다.
+- RPG Maker MV / MZ: 게임 데이터(대사, 선택지, 아이템, 스킬, 메뉴 용어 등)를 고른 번역 엔진으로 한 번에 번역해 바꿔 넣음
+  · 원본은 data_GTbackup 폴더에 백업
+  · 번역문은 게임폴더\GameTranslator_RPG\translations.tsv 에 저장
+    (원문<TAB>번역. 메모장으로 고친 뒤 같은 버튼 → '예(다시 적용)' 하면 반영)
+  · 같은 버튼 → '아니요' = 원본 일본어로 복구
+  · 중간에 끊겨도 다시 실행하면 이어서 번역
+  · 플러그인 설정(plugins.js)이나 그림 속 글자는 번역하지 않습니다.
+- 그 밖의 엔진: 엔진 이름과 맞는 도구를 알려줍니다.
+
+[번역 엔진 고르기]
+- GameShelf → ⚙설정 → '게임 번역 엔진' 에서 고릅니다. (이 폴더의 engine.json 에 저장되어,
+  폴더 오른쪽 클릭으로 실행해도 같은 엔진을 씁니다. engine.json 이 없으면 구글 번역)
+- Google / Bing : 키 없이 무료
+- Papago       : Unity 는 키 없이 / RPG Maker 는 네이버 클라우드 키(Client ID, Secret) 필요
+- DeepL        : API 키 필요 (Unity 는 키가 없으면 XUnity 내장 웹 방식)
+- PC의 AI 모델 : Ollama / LM Studio. Unity 게임은 GameShelf 를 켜 둔 상태에서 실행해야 번역됨
+- 엔진을 바꾸면 GameShelf 가 이미 설치된 Unity 게임에도 적용할지 물어봅니다.
+- RPG Maker 는 이미 번역된 문장(translations.tsv)은 그대로 두고 새 문장만 새 엔진으로 번역합니다.
+  전부 새 엔진으로 다시 하려면 게임 폴더의 GameTranslator_RPG\translations.tsv 를 지운 뒤 '다시 적용'.
