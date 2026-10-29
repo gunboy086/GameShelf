@@ -1,0 +1,40 @@
+# 태그(v1.0.0 등)를 올리면 Windows 에서 GameShelf.exe 를 만들고
+# 개인 파일을 뺀 GameShelf_배포.zip 을 Releases 에 자동으로 올린다.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build exe and release zip
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          ./make_release.ps1 -NoExplorer
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GameShelf
+          path: GameShelf_배포.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: GameShelf_배포.zip
+          generate_release_notes: true
