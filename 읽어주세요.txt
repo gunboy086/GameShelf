@@ -1,0 +1,28 @@
+﻿GameShelf — 일본 동인게임 라이브러리 + 자동 한국어 번역 + 바이러스 검사
+
+[설치]
+1. 이 폴더를 원하는 곳에 둡니다. (경로에 한글이 없는 곳 추천, 예: D:\Tools\GameShelf)
+2. GameShelf.exe 실행
+   - 'Windows의 PC 보호' 창이 뜨면 '추가 정보' → '실행'
+   - GameTranslator 폴더는 GameShelf.exe 옆에 그대로 두세요.
+3. 왼쪽 위 '폴더 추가' → 게임이 들어 있는 폴더 선택
+4. (선택) '설정'에서 VirusTotal 키 · 번역 엔진 · DeepL/Papago 키 · 내 PC AI 설정
+
+[핵심 기능]
+- zip/7z 게임: '압축 풀기' → Defender + VirusTotal 검사 → 한국어 번역기 자동 설치 → 실행
+- Unity(Mono): 실시간 번역 (BepInEx + XUnity.AutoTranslator)
+- RPG Maker MV/MZ: 대사·메뉴 번역 (원본은 data_GTbackup 에 백업)
+- 번역 엔진: Google · Bing · Papago · DeepL · 내 PC AI(Ollama / LM Studio)
+
+[주의]
+- 바이러스 검사는 참고용입니다. 안 걸려도 100% 안전하다는 뜻은 아닙니다.
+- 'VirusTotal에 올려서 검사'로 올린 파일은 보안 회사들이 볼 수 있습니다.
+- 번역할 때 제목·대사가 고른 번역 서비스로 전송됩니다. (내 PC AI는 전송 안 됨)
+- Unity 게임 번역은 게임 경로에 한글/일본어가 있으면 동작하지 않습니다.
+- 7z 게임을 풀려면 반디집 또는 7-Zip 이 필요합니다.
+- 사용하면서 생기는 GameShelf_data 폴더(게임 목록·API 키)는 다른 사람에게 주지 마세요.
+
+[포함된 외부 프로그램]
+- BepInEx 5.4.22 (MIT)  https://github.com/BepInEx/BepInEx/tree/v5-lts
+- XUnity.AutoTranslator 5.6.3 (MIT)  https://github.com/bbepis/XUnity.AutoTranslator
+- PySide6 / Qt (LGPL-3.0)  https://www.qt.io/qt-for-python
