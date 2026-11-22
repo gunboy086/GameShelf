@@ -32,9 +32,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
+import gs_shrink
 from PySide6.QtCore import (Qt, QObject, Signal, QRunnable, QThreadPool, QTimer,
                             QSize, QUrl, QFileInfo, QRectF, QPointF)
-from PySide6.QtGui import (QPixmap, QIcon, QPainter, QColor, QFont, QPalette,
+from PySide6.QtGui import (QPixmap, QIcon, QPainter, QColor, QFont, QPalette, QPainterPath,
                            QDesktopServices, QAction, QImageReader, QPen,
                            QPolygonF)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QListWidget,
@@ -69,6 +70,10 @@ MATCH_THRESHOLD = 0.6      # 이름 검색 자동 채택 기준 (0~1)
 TRANSLATOR_DIR = BASE_DIR / "GameTranslator"
 TRANSLATOR_PS1 = TRANSLATOR_DIR / "GameTranslator.ps1"
 TRANSLATOR_AUTO_LIMIT = 20 * 1024 * 1024   # 번역기 툴이 이보다 크면 압축 풀기 후 자동 설치 안 함
+
+# GameCheat (RPG 쯔꾸르 MV/MZ 치트) — GameShelf 폴더 안의 GameCheat 폴더
+CHEAT_DIR = BASE_DIR / "GameCheat"
+CHEAT_JS = CHEAT_DIR / "GS_Cheat.js"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
@@ -887,7 +892,7 @@ def scan_root(root, max_depth=8):
             games.append(d)
             return
         for f in files:                   # 이 폴더에 있는 압축파일 각각 = 게임 하나
-            if os.path.splitext(f.name)[1].lower() in ARCHIVE_EXT:
+            if os.path.splitext(f.name)[1].lower() in ARCHIVE_EXT and not is_clear_archive(f.name):
                 games.append(f.path)
         if depth < max_depth:
             for sub in dirs:
@@ -917,6 +922,278 @@ def run_translator(folder, auto=False):
     if auto:
         args.append("-Auto")
     return subprocess.Popen(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+# ---------------------------------------------------------------- RPG 쯔꾸르 치트 (GameCheat/GS_Cheat.js)
+CHEAT_NAME = "GS_Cheat"
+PLUGINS_RE = re.compile(r"(\$plugins\s*=\s*)(\[.*\])", re.S)
+RPG_CODE_RE = re.compile(r"\\[A-Za-z]+\[[^\]]*\]")
+RPG_CODE2_RE = re.compile(r"\\[{}.|!><^$]")
+DISPLAY_NAME_RE = re.compile(r'"displayName"\s*:\s*("(?:[^"\\]|\\.)*")')
+RPG_SKIP_DIRS = {"img", "audio", "movies", "locales", "save", "fonts", "icon", "swiftshader",
+                 "node_modules", "effects", "css", "data", "js", "gametranslator_rpg"}
+
+
+class CheatError(Exception):
+    pass
+
+
+def rpg_find(folder, max_depth=3):
+    """RPG 쯔꾸르 MV/MZ 게임이면 (js 폴더, data 폴더, 'MV'/'MZ'), 아니면 None"""
+    if not folder or not os.path.isdir(folder):
+        return None
+
+    def visit(d, depth):
+        js, data = os.path.join(d, "js"), os.path.join(d, "data")
+        if os.path.isfile(os.path.join(js, "plugins.js")) and os.path.isfile(os.path.join(data, "System.json")):
+            if os.path.isfile(os.path.join(js, "rmmz_core.js")):
+                return Path(js), Path(data), "MZ"
+            if os.path.isfile(os.path.join(js, "rpg_core.js")):
+                return Path(js), Path(data), "MV"
+        if depth >= max_depth:
+            return None
+        try:
+            subs = [x.path for x in os.scandir(d) if x.is_dir() and not x.name.startswith(".")
+                    and x.name.lower() not in RPG_SKIP_DIRS and not x.name.lower().endswith("_gtbackup")]
+        except OSError:
+            return None
+        subs.sort(key=lambda x: os.path.basename(x).lower() != "www")
+        for sub in subs:
+            r = visit(sub, depth + 1)
+            if r:
+                return r
+        return None
+
+    return visit(folder, 0)
+
+
+def _plugins_load(js_dir):
+    p = js_dir / "plugins.js"
+    text = p.read_text(encoding="utf-8-sig")
+    m = PLUGINS_RE.search(text)
+    if not m:
+        raise CheatError("plugins.js 형식을 알 수 없어서 치트를 넣지 못했습니다.")
+    try:
+        arr = json.loads(m.group(2))
+    except ValueError as ex:
+        raise CheatError(f"plugins.js를 읽지 못했습니다 ({ex}).")
+    return p, text, m, arr
+
+
+def _plugins_save(p, text, m, arr):
+    body = "[\n" + ",\n".join(json.dumps(x, ensure_ascii=False) for x in arr) + "\n]"
+    p.write_text(text[:m.start(2)] + body + text[m.end(2):], encoding="utf-8")
+
+
+def cheat_installed(info):
+    js = info[0]
+    try:
+        return (js / "plugins" / "GS_Cheat.js").is_file() and \
+            f'"{CHEAT_NAME}"' in (js / "plugins.js").read_text(encoding="utf-8-sig")
+    except OSError:
+        return False
+
+
+def install_cheat(folder):
+    """plugins.js 백업(처음 한 번) → js/plugins/GS_Cheat.js 복사 → plugins.js 맨 끝에 등록"""
+    info = rpg_find(folder)
+    if not info:
+        raise CheatError("RPG 쯔꾸르 MV/MZ 게임 파일(js/plugins.js, data/System.json)을 찾지 못했습니다.\n"
+                         "(게임이 exe 파일 하나로 묶여 있는 경우에는 넣을 수 없습니다)")
+    if not CHEAT_JS.is_file():
+        raise CheatError(f"치트 파일이 없습니다:\n{CHEAT_JS}\n\nGameCheat 폴더를 GameShelf 폴더 안에 넣어주세요.")
+    js = info[0]
+    p, text, m, arr = _plugins_load(js)
+    bk = js / "plugins.js.gs_backup"
+    if not bk.exists():
+        shutil.copy2(p, bk)
+    (js / "plugins").mkdir(exist_ok=True)
+    shutil.copyfile(CHEAT_JS, js / "plugins" / "GS_Cheat.js")
+    arr = [x for x in arr if not (isinstance(x, dict) and x.get("name") == CHEAT_NAME)]
+    arr.append({"name": CHEAT_NAME, "status": True,
+                "description": "[GameShelf] 게임 화면 위 치트 창 (` 키)", "parameters": {"mainKey": "192"}})
+    _plugins_save(p, text, m, arr)
+    return info
+
+
+def uninstall_cheat(folder):
+    info = rpg_find(folder)
+    if not info:
+        raise CheatError("RPG 쯔꾸르 MV/MZ 게임 파일을 찾지 못했습니다.")
+    js = info[0]
+    p, text, m, arr = _plugins_load(js)
+    keep = [x for x in arr if not (isinstance(x, dict) and x.get("name") == CHEAT_NAME)]
+    if len(keep) != len(arr):
+        _plugins_save(p, text, m, keep)
+    for f in (js / "plugins" / "GS_Cheat.js", js / "plugins" / "GS_Cheat_ko.json", js / "plugins.js.gs_backup"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    return info
+
+
+def rpg_strip(s):
+    return RPG_CODE2_RE.sub("", RPG_CODE_RE.sub("", s)).strip()
+
+
+def _tsv_unesc(s):
+    return re.sub(r"\\([nt\\])", lambda m: {"n": "\n", "t": "\t", "\\": "\\"}[m.group(1)], s)
+
+
+def cheat_names(data_dir):
+    """치트 창에 나오는 일본어 이름 (아이템·무기·방어구·설명·맵·변수·스위치·능력치 용어)"""
+    out, disp = [], {}
+
+    def add(x):
+        if isinstance(x, str):
+            k = rpg_strip(x)
+            if k and JA_RE.search(k):
+                out.append(k)
+
+    def load(name):
+        try:
+            return json.loads((data_dir / name).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return None
+
+    for name in ("Items.json", "Weapons.json", "Armors.json"):
+        for x in load(name) or []:
+            if isinstance(x, dict):
+                add(x.get("name"))
+                add(x.get("description"))
+    for name in ("Actors.json", "Classes.json"):
+        for x in load(name) or []:
+            if isinstance(x, dict):
+                add(x.get("name"))
+    sysd = load("System.json") or {}
+    for key in ("variables", "switches"):
+        for x in sysd.get(key) or []:
+            add(x)
+    add(sysd.get("currencyUnit"))
+    for key in ("params", "basic"):
+        for x in (sysd.get("terms") or {}).get(key) or []:
+            add(x)
+    for mi in load("MapInfos.json") or []:
+        if not isinstance(mi, dict):
+            continue
+        add(mi.get("name"))
+        try:   # 맵 표시 이름만 빠르게 (맵 전체를 읽지 않음)
+            mt = DISPLAY_NAME_RE.search((data_dir / ("Map%03d.json" % mi["id"])).read_text(encoding="utf-8-sig"))
+            dn = json.loads(mt.group(1)) if mt else ""
+        except (OSError, ValueError, KeyError, TypeError):
+            dn = ""
+        if dn:
+            disp[str(mi["id"])] = dn
+            add(dn)
+    return list(dict.fromkeys(out)), disp
+
+
+def build_cheat_dict(folder):
+    """GS_Cheat_ko.json 만들기. 번역기(GameTranslator) 번역 파일에 있는 건 그대로 쓰고 나머지만 번역.
+    반환: (전체 이름 수, 번역 못 한 수)"""
+    info = rpg_find(folder)
+    if not info:
+        raise CheatError("RPG 쯔꾸르 게임이 아닙니다.")
+    js, data, _ = info
+    names, disp = cheat_names(data)
+    out_p = js / "plugins" / "GS_Cheat_ko.json"
+    t = {}
+    try:
+        t = dict(json.loads(out_p.read_text(encoding="utf-8")).get("t") or {})
+    except (OSError, ValueError, AttributeError):
+        pass
+    for base in (data.parent, data.parent.parent, Path(folder)):
+        tsv = base / "GameTranslator_RPG" / "translations.tsv"
+        if not tsv.is_file():
+            continue
+        try:
+            for line in tsv.read_text(encoding="utf-8-sig").splitlines():
+                if line.startswith("#") or "\t" not in line:
+                    continue
+                k, v = line.split("\t", 1)
+                k, v = rpg_strip(_tsv_unesc(k)), _tsv_unesc(v).strip()
+                if k in names and v and not t.get(k):
+                    t[k] = v
+        except OSError:
+            pass
+    todo = [k for k in names if not t.get(k)]
+    for i in range(0, len(todo), 50):
+        chunk = todo[i:i + 50]
+        res = Translator.many([re.sub(r"\s*\n\s*", " ", c) for c in chunk], "ja", "ko")
+        for k, v in zip(chunk, res):
+            if v:
+                t[k] = v
+        if not any(res):
+            break
+    out_p.parent.mkdir(exist_ok=True)
+    out_p.write_text(json.dumps({"t": t, "mapDisplay": disp}, ensure_ascii=False), encoding="utf-8")
+    return len(names), sum(1 for k in names if not t.get(k))
+
+
+SAVE_DIR = DATA_DIR / "saves"
+SAVE_NAMES = {"save", "saves", "savedata", "save_data", "savefile", "savefiles"}
+
+
+def find_save_dirs(folder, max_depth=4):
+    """게임 폴더 안의 세이브 폴더들 (RPG 쯔꾸르 save, WOLF Save, 렌파이 saves 등)"""
+    out = []
+
+    def visit(d, depth):
+        try:
+            ents = list(os.scandir(d))
+        except OSError:
+            return
+        for x in ents:
+            if not x.is_dir() or x.name == gs_shrink.BACKUP_DIR:
+                continue
+            if x.name.lower() in SAVE_NAMES:
+                try:
+                    if any(True for _ in os.scandir(x.path)):
+                        out.append(x.path)
+                except OSError:
+                    pass
+            elif depth < max_depth:
+                visit(x.path, depth + 1)
+    visit(folder, 0)
+    return out
+
+
+def save_store(e):
+    return SAVE_DIR / re.sub(r'[\\/:*?"<>|]+', "_", e.get("code") or e.get("name") or "game")[:80]
+
+
+def backup_saves(e, folder):
+    """세이브 폴더를 GameShelf_data/saves/<게임>/ 에 복사. 반환: 복사한 폴더 수"""
+    n = 0
+    for sd in find_save_dirs(folder):
+        dst = save_store(e) / os.path.relpath(sd, folder)
+        shutil.copytree(sd, dst, dirs_exist_ok=True)
+        n += 1
+    return n
+
+
+def restore_saves(e, folder):
+    """압축을 다시 풀었을 때 보관해 둔 세이브를 제자리에 (이미 있는 파일은 덮어쓰지 않음)"""
+    src = save_store(e)
+    if not src.is_dir():
+        return 0
+    n = 0
+    for root, _, files in os.walk(src):
+        for f in files:
+            sp = os.path.join(root, f)
+            dp = os.path.join(folder, os.path.relpath(sp, src))
+            if not os.path.exists(dp):
+                os.makedirs(os.path.dirname(dp), exist_ok=True)
+                shutil.copy2(sp, dp)
+                n += 1
+    return n
+
+
+def shrink_mark(e):
+    """용량 줄이기 상태: 'pending'(확인 대기, 원본 백업 있음) / 'done'(확정) / None"""
+    sh = e.get("shrink") or {}
+    return sh.get("state") if sh.get("state") in ("pending", "done") else None
 
 
 def reveal(path):
@@ -1173,11 +1450,12 @@ def _safe_rel(name):
     return os.path.join(*parts)
 
 
-def extract_archive(path, pw=""):
+def extract_archive(path, pw="", name=None, parent=None):
     """압축파일 옆에 '압축파일 이름' 폴더로 풀기. 반환: (풀린 폴더, 오류 메시지)
-    압축 안이 폴더 하나로만 감싸져 있으면 그 껍데기를 벗겨 이름 폴더 바로 아래에 파일이 오게 함."""
-    parent = os.path.dirname(path)
-    name = os.path.splitext(os.path.basename(path))[0].rstrip(". ") or "game"
+    압축 안이 폴더 하나로만 감싸져 있으면 그 껍데기를 벗겨 이름 폴더 바로 아래에 파일이 오게 함.
+    name/parent 를 주면 그 이름·위치로 품 (클리어본을 원래 게임 폴더 이름으로 풀 때)"""
+    parent = parent or os.path.dirname(path)
+    name = name or os.path.splitext(os.path.basename(path))[0].rstrip(". ") or "game"
     tmp = os.path.join(parent, f".{name}.gameshelf_tmp")
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp)
@@ -1228,6 +1506,92 @@ def extract_archive(path, pw=""):
     os.replace(src, dest)
     shutil.rmtree(tmp, ignore_errors=True)
     return dest, msg
+
+
+CLEAR_TAG = "_클리어본"           # 용량 줄인 압축파일 이름 꼬리표 (예: RJ432234_클리어본.7z)
+
+
+def is_clear_archive(path):
+    """클리어본·이전 버전 압축파일 (스캔할 때 새 게임으로 잡지 않음)"""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return stem.endswith(CLEAR_TAG) or (CLEAR_TAG + " 이전 ") in stem or " (이전 압축파일 " in stem
+
+
+STORE_EXT = {".png", ".rpgmvp", ".png_", ".jpg", ".jpeg", ".webp", ".ogg", ".rpgmvo", ".ogg_", ".m4a",
+             ".rpgmvm", ".m4a_", ".mp4", ".webm", ".zip", ".7z", ".rar", ".pak", ".dat", ".bin"}
+
+
+def _count_files(folder):
+    n = 0
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d != gs_shrink.BACKUP_DIR]
+        n += len(files)
+    return n
+
+
+def repack_archive(folder, archive, progress=None):
+    """압축 푼(용량 줄인) 폴더를 세이브까지 통째로 다시 압축해서 archive 를 새로 만듦.
+    같은 이름·형식(.7z/.zip)으로 만들어 목록 연결은 그대로. 새 파일을 먼저 만들고 확인한 뒤 바꿔치기.
+    반환: (새 압축파일 크기, 옛 압축파일 임시 경로) — 옛 파일 처리는 부르는 쪽에서"""
+    ext = os.path.splitext(archive)[1].lower()
+    if ext not in (".7z", ".zip"):
+        raise RuntimeError(f"{ext} 형식은 다시 만들 수 없습니다 (.7z/.zip만 가능)")
+    if os.path.isdir(os.path.join(folder, gs_shrink.BACKUP_DIR)):
+        raise RuntimeError("용량 줄이기가 아직 확인 대기 중입니다. 먼저 확정해주세요.")
+    parent, name = os.path.dirname(folder), os.path.basename(folder.rstrip("\\/"))
+    new = archive + ".gs_new" + ext
+    for f in (new,):
+        if os.path.exists(f):
+            os.remove(f)
+    total = _count_files(folder)
+    kind, exe = find_archiver(prefer="7z")
+    if kind == "7z":
+        code, out = _run_tool([exe, "a", "-t" + ext[1:], "-mx=1", "-y", "-ssw", "-scsUTF-8",
+                               f"-xr!{gs_shrink.BACKUP_DIR}", new, os.path.join(parent, name)], 7200)
+    elif kind == "bz":
+        code, out = _run_tool([exe, "c", "-y", "-l:1", f"-fmt:{ext[1:]}", new, folder], 7200)
+    elif ext == ".zip":
+        code, out = 0, ""
+        with zipfile.ZipFile(new, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+            n = 0
+            for root, dirs, files in os.walk(folder):
+                dirs[:] = [d for d in dirs if d != gs_shrink.BACKUP_DIR]
+                for f in files:
+                    fp = os.path.join(root, f)
+                    arc = os.path.join(name, os.path.relpath(fp, folder))
+                    ct = zipfile.ZIP_STORED if os.path.splitext(f)[1].lower() in STORE_EXT else zipfile.ZIP_DEFLATED
+                    zf.write(fp, arc, compress_type=ct)
+                    n += 1
+                    if progress and n % 50 == 0:
+                        progress(n, total)
+    else:
+        raise RuntimeError("7z 압축파일을 만들려면 반디집 또는 7-Zip이 필요합니다 (https://www.7-zip.org/)")
+    if code != 0 or not os.path.isfile(new) or os.path.getsize(new) == 0:
+        try:
+            os.remove(new)
+        except OSError:
+            pass
+        raise RuntimeError("압축파일을 만들지 못했습니다: " + " ".join(out.strip().splitlines()[-2:])[:200])
+    # 확인: 들어간 파일 수
+    if kind == "7z":
+        c2, o2 = _run_tool([exe, "l", "-slt", "-sccUTF-8", new], 600)
+        listed = len(re.findall(r"^Attributes = [^D\r\n]", o2, re.M))
+    elif kind == "bz":
+        c2, o2 = _run_tool([exe, "l", "-list:s", new], 600)
+        listed = sum(1 for ln in o2.splitlines() if ln.strip() and not ln.strip().endswith(("\\", "/")))
+    else:
+        with zipfile.ZipFile(new) as zf:
+            listed = sum(1 for i in zf.infolist() if not i.is_dir())
+    if listed < total:
+        os.remove(new)
+        raise RuntimeError(f"새 압축파일 확인 실패 (파일 {total}개 중 {listed}개만 들어감). 원본은 그대로 둡니다.")
+    old = archive + ".gs_old" + ext
+    if os.path.exists(old):                 # 예전에 중간에 멈춘 흔적 — 원본일 수 있으니 휴지통으로
+        send_to_recycle_bin(old)
+    if os.path.exists(archive):
+        os.replace(archive, old)
+    os.replace(new, archive)
+    return os.path.getsize(archive), (old if os.path.exists(old) else "")
 
 
 def exec_members(path, is_archive, tmpdir, limit=25):
@@ -1373,6 +1737,8 @@ class Signals(QObject):
     engine_scan = Signal(list)
     precheck = Signal(str, dict)
     extracted = Signal(str, str, str)
+    cheat_msg = Signal(str)
+    repacked = Signal(str, str, str)      # key, 오류, 다음 할 일
 
 
 class FuncTask(QRunnable):
@@ -1410,6 +1776,493 @@ def make_lookup_task(key, entry, sig, stop_evt, cand=None):
         sig.looked_up.emit(key, res)
 
     return FuncTask(job)
+
+
+# ---------------------------------------------------------------- 평점 (별 5개, 반 개 단위)
+RATING_CATS = ["거유", "료나", "게임성", "그림체"]
+STAR_GOLD = "#f5b301"
+STAR_LINE = "#c99a1c"
+
+
+def rating_total(e):
+    r = e.get("rating") or {}
+    return sum(float(r.get(c, 0) or 0) for c in RATING_CATS) if r else None
+
+
+def fmt_score(v):
+    return f"{v:.1f}".rstrip("0").rstrip(".") if v is not None else ""
+
+
+def star_path(cx, cy, r):
+    import math
+    path = QPainterPath()
+    for i in range(10):
+        ang = -math.pi / 2 + i * math.pi / 5
+        rr = r if i % 2 == 0 else r * 0.45
+        pt = QPointF(cx + rr * math.cos(ang), cy + rr * math.sin(ang))
+        path.moveTo(pt) if i == 0 else path.lineTo(pt)
+    path.closeSubpath()
+    return path
+
+
+def paint_stars(p, x, y, size, value, gap=3):
+    """별 5개: 채운 별 + 반 별(왼쪽 반만 채움) + 남은 별은 윤곽선"""
+    p.setRenderHint(QPainter.Antialiasing)
+    for i in range(5):
+        cx, cy = x + i * (size + gap) + size / 2, y + size / 2
+        path = star_path(cx, cy, size / 2)
+        fill = max(0.0, min(1.0, value - i))
+        if fill > 0:
+            p.save()
+            p.setClipRect(QRectF(cx - size / 2, y, size * fill, size))
+            p.fillPath(path, QColor(STAR_GOLD))
+            p.restore()
+        p.setPen(QPen(QColor(STAR_LINE), max(1.2, size / 14)))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+
+
+class StarWidget(QWidget):
+    """누르거나 끌어서 0.5 단위로 점수 고르기 (별의 왼쪽 반 = .5). 오른쪽 클릭 = 0점"""
+    changed = Signal(float)
+
+    def __init__(self, value=0.0, size=30, parent=None):
+        super().__init__(parent)
+        self.value, self.size, self.gap = float(value), size, 4
+        self.hover = None
+        self.setMouseTracking(True)
+        self.setFixedSize(5 * size + 4 * self.gap + 2, size + 2)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def val_at(self, x):
+        step = self.size + self.gap
+        i = int(x // step)
+        frac = (x - i * step) / self.size
+        v = i + (0.5 if frac < 0.5 else 1.0)
+        return max(0.5, min(5.0, v))
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        paint_stars(p, 1, 1, self.size, self.hover if self.hover is not None else self.value, self.gap)
+        p.end()
+
+    def mouseMoveEvent(self, ev):
+        x = ev.position().x() if hasattr(ev, "position") else ev.x()
+        if ev.buttons() & Qt.LeftButton:
+            self.set_value(self.val_at(x))
+        else:
+            self.hover = self.val_at(x)
+            self.update()
+
+    def mousePressEvent(self, ev):
+        x = ev.position().x() if hasattr(ev, "position") else ev.x()
+        self.set_value(0.0 if ev.button() == Qt.RightButton else self.val_at(x))
+
+    def leaveEvent(self, ev):
+        self.hover = None
+        self.update()
+
+    def set_value(self, v):
+        self.value = float(v)
+        self.hover = None
+        self.update()
+        self.changed.emit(self.value)
+
+
+def rating_pixmap(rating, width=340):
+    """오른쪽 정보 영역용: 항목별 별 + 점수 + 합계"""
+    row_h, size = 26, 18
+    h = row_h * (len(RATING_CATS) + 1) + 6
+    pm = QPixmap(width, h)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    f = QFont()
+    f.setPixelSize(13)
+    p.setFont(f)
+    total = 0.0
+    for i, c in enumerate(RATING_CATS):
+        v = float(rating.get(c, 0) or 0)
+        total += v
+        y = i * row_h + 3
+        p.setPen(QColor("#999999"))
+        p.drawText(QRectF(0, y, 60, size), Qt.AlignVCenter | Qt.AlignLeft, c)
+        paint_stars(p, 64, y, size, v)
+        p.setPen(QColor("#8a8a8a"))
+        p.drawText(QRectF(64 + 5 * size + 20 + 6, y, 70, size), Qt.AlignVCenter | Qt.AlignLeft, f"{fmt_score(v)} / 5")
+    y = len(RATING_CATS) * row_h + 3
+    f.setBold(True)
+    f.setPixelSize(15)
+    p.setFont(f)
+    p.setPen(QColor(STAR_GOLD))
+    p.drawText(QRectF(0, y, width, row_h), Qt.AlignVCenter | Qt.AlignLeft,
+               f"합계  {fmt_score(total)} / 20   (평균 ★ {fmt_score(round(total / 4 * 2) / 2)})")
+    p.end()
+    return pm
+
+
+class RatingDialog(QDialog):
+    def __init__(self, win, e, reason=""):
+        super().__init__(win)
+        self.setWindowTitle("⭐ 평점 남기기 — " + display_name(e))
+        v = QVBoxLayout(self)
+        t = QLabel(f"<b>{html.escape(display_name(e))}</b><br>"
+                   + (f"<span style='color:#999'>{html.escape(reason)}</span><br>" if reason else "")
+                   + "<span style='color:#999'>평점을 남기면 '🏆 클리어한 게임' 목록에 저장됩니다. "
+                     "별의 왼쪽 반을 누르면 반 개(.5), 오른쪽 클릭은 0점.</span>")
+        t.setWordWrap(True)
+        v.addWidget(t)
+        old = e.get("rating") or {}
+        g = QGridLayout()
+        self.stars, self.lbls = {}, {}
+        for i, c in enumerate(RATING_CATS):
+            lb = QLabel(c)
+            f = lb.font()
+            f.setPointSize(f.pointSize() + 2)
+            lb.setFont(f)
+            sw = StarWidget(old.get(c, 0))
+            sc = QLabel()
+            sw.changed.connect(self.update_total)
+            g.addWidget(lb, i, 0)
+            g.addWidget(sw, i, 1)
+            g.addWidget(sc, i, 2)
+            self.stars[c], self.lbls[c] = sw, sc
+        v.addLayout(g)
+        self.total = QLabel()
+        f = self.total.font()
+        f.setPointSize(f.pointSize() + 3)
+        f.setBold(True)
+        self.total.setFont(f)
+        v.addWidget(self.total)
+        bb = QDialogButtonBox()
+        bb.addButton("저장", QDialogButtonBox.AcceptRole)
+        bb.addButton("건너뛰기", QDialogButtonBox.RejectRole)
+        self.cleared = False
+        if old:
+            b = bb.addButton("평점 지우기", QDialogButtonBox.DestructiveRole)
+            b.clicked.connect(self.clear)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self.update_total()
+
+    def clear(self):
+        self.cleared = True
+        self.accept()
+
+    def update_total(self, *_):
+        tot = 0.0
+        for c in RATING_CATS:
+            val = self.stars[c].value
+            tot += val
+            self.lbls[c].setText(f"{fmt_score(val)} / 5")
+        self.total.setText(f"합계 {fmt_score(tot)} / 20")
+
+    def result_rating(self):
+        r = {c: self.stars[c].value for c in RATING_CATS}
+        r["date"] = time.time()
+        return r
+
+
+# ---------------------------------------------------------------- 용량 줄이기 창
+class ShrinkSignals(QObject):
+    progress = Signal(int, int, str)
+    done = Signal(str)
+
+
+class ShrinkDialog(QDialog):
+    """1단계 분석 · 2단계 이미지/음악 재압축(백업·되돌리기·확정) · 3단계 실행 파일 공유"""
+
+    def __init__(self, win, key):
+        super().__init__(win)
+        self.win, self.key = win, key
+        self.e = win.lib["games"][key]
+        self.folder = win.game_dir(self.e)
+        self.info = rpg_find(self.folder) if self.folder else None
+        self.ffmpeg = gs_shrink.find_ffmpeg([str(BASE_DIR)])
+        self.busy = False
+        self.stop_flag = False
+        self.sig = ShrinkSignals()
+        self.sig.progress.connect(self.on_progress)
+        self.sig.done.connect(self.on_done)
+        self.setWindowTitle("💾 용량 줄이기 — " + display_name(self.e))
+        self.resize(760, 640)
+        v = QVBoxLayout(self)
+        self.info_lbl = QLabel()
+        self.info_lbl.setWordWrap(True)
+        self.info_lbl.setTextFormat(Qt.RichText)
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setWidget(self.info_lbl)
+        v.addWidget(sc, 1)
+
+        g = QGridLayout()
+        self.b_ll = QPushButton("🖼 이미지 무손실 압축 (화질 그대로)")
+        self.b_hq = QPushButton("🖼 이미지 고화질 압축 (훨씬 작게)")
+        self.b_m4a = QPushButton("🎵 안 쓰는 중복 음악(m4a) 정리")
+        self.b_aud = QPushButton("🎵 음악 압축")
+        self.b_ll.clicked.connect(lambda: self.run_images("lossless"))
+        self.b_hq.clicked.connect(lambda: self.run_images("hq"))
+        self.b_m4a.clicked.connect(self.run_m4a)
+        self.b_aud.clicked.connect(self.run_audio)
+        g.addWidget(self.b_ll, 0, 0)
+        g.addWidget(self.b_hq, 0, 1)
+        g.addWidget(self.b_m4a, 1, 0)
+        g.addWidget(self.b_aud, 1, 1)
+        v.addLayout(g)
+
+        h = QHBoxLayout()
+        self.b_play = QPushButton("▶ 게임 실행해서 확인")
+        self.b_commit = QPushButton("✅ 확정 (원본 백업 지우기)")
+        self.b_restore = QPushButton("↩ 되돌리기 (원본으로)")
+        self.b_play.clicked.connect(lambda: win.run_game(key))
+        self.b_commit.clicked.connect(self.do_commit)
+        self.b_restore.clicked.connect(self.do_restore)
+        for b in (self.b_play, self.b_commit, self.b_restore):
+            h.addWidget(b)
+        v.addLayout(h)
+
+        from PySide6.QtWidgets import QCheckBox
+        self.cb_auto = QCheckBox("압축이 끝나면 확인 없이 바로 확정 (원본 백업을 바로 휴지통으로 — 휴지통을 비우기 전까지는 되살릴 수 있음)")
+        self.cb_auto.setChecked(bool(win.lib.get("settings", {}).get("shrink_autocommit")))
+        self.cb_auto.toggled.connect(lambda v: (win.lib.setdefault("settings", {}).__setitem__("shrink_autocommit", v),
+                                                win.schedule_save()))
+        v.addWidget(self.cb_auto)
+        self.b_share = QPushButton("🔗 모든 게임의 같은 실행 파일 공유하기 (RPG 쯔꾸르 MV/MZ, 화질·내용 변화 없음)")
+        self.b_share.clicked.connect(self.run_share)
+        v.addWidget(self.b_share)
+
+        self.prog = QProgressBar()
+        self.prog.setVisible(False)
+        self.stat = QLabel("")
+        self.b_stop = QPushButton("중지")
+        self.b_stop.setVisible(False)
+        self.b_stop.clicked.connect(self.ask_stop)
+        h2 = QHBoxLayout()
+        h2.addWidget(self.prog, 1)
+        h2.addWidget(self.b_stop)
+        v.addLayout(h2)
+        v.addWidget(self.stat)
+        self.refresh()
+
+    # ------------------------------------------------------------ 화면
+    def refresh(self):
+        H = gs_shrink.human
+        if not self.folder or not os.path.isdir(self.folder):
+            self.info_lbl.setText("게임 폴더가 없습니다. 압축 게임이면 먼저 압축을 풀어주세요.")
+            for b in (self.b_ll, self.b_hq, self.b_m4a, self.b_aud, self.b_commit, self.b_restore, self.b_play):
+                b.setEnabled(False)
+            return
+        a = gs_shrink.analyze(self.folder, self.info, self.ffmpeg)
+        bk = gs_shrink.backup_info(self.folder)
+        c, est = a["cats"], a["est"]
+        rpg = bool(self.info)
+        kind = f"RPG 쯔꾸르 {self.info[2]}" if rpg else "RPG 쯔꾸르 MV/MZ가 아님"
+        rows = [
+            ("장면·그림 이미지 (압축 가능)", c["image"]),
+            ("이미 압축된 이미지", c["image_done"]),
+            ("기타 이미지 (Live2D 등, 건드리지 않음)", c["image_skip"]),
+            ("음악·음성", c["audio"]),
+            ("중복 음악 m4a (PC에선 안 씀)", c["m4a_dup"]),
+            ("영상", c["movie"]),
+            ("게임 실행 프로그램 (nw.js)", c["runtime"]),
+            ("대사·데이터", c["data"]),
+            ("기타", c["other"]),
+        ]
+        t = (f"<h3 style='margin:0'>{html.escape(display_name(self.e))}</h3>"
+             f"<p>{html.escape(self.folder)}<br>{kind} · 파일 {a['files']:,}개 · <b>{H(a['total'])}</b></p>"
+             "<table cellspacing=0 cellpadding=3 width='100%'>"
+             "<tr><th align=left>종류</th><th align=right>파일</th><th align=right>용량</th><th align=right>비율</th></tr>")
+        for name, (n, sz) in rows:
+            if n:
+                t += (f"<tr><td>{name}</td><td align=right>{n:,}</td><td align=right>{H(sz)}</td>"
+                      f"<td align=right>{sz * 100 // max(a['total'], 1)}%</td></tr>")
+        t += "</table><p><b>폴더별 큰 순서</b>: " + ", ".join(
+            f"{html.escape(d)} {H(sz)}" for d, sz in a["dirs"][:6]) + "</p>"
+        t += "<p><b>예상 절약량</b><br>"
+        if rpg and c["image"][0]:
+            t += (f"· 이미지 무손실: 약 {H(est['img_lossless'])} (화질 완전히 같음)<br>"
+                  f"· 이미지 고화질: 약 {H(est['img_hq'])} (눈으로 구분하기 어려움)<br>")
+        if est["m4a"]:
+            t += f"· 중복 m4a 정리: {H(est['m4a'])} (MV 게임은 PC에서 ogg만 씀, 소리 그대로)<br>"
+        if c["audio"][0]:
+            t += (f"· 음악 압축: 약 {H(est['audio'])}<br>" if self.ffmpeg else
+                  "· 음악 압축: ffmpeg가 필요합니다 (아래 안내)<br>")
+        if c["runtime"][1]:
+            t += f"· 실행 프로그램 {H(c['runtime'][1])}: 다른 RPG 쯔꾸르 게임과 같은 버전이면 '실행 파일 공유'로 공유 가능<br>"
+        if not rpg:
+            t += "· 이미지·음악 압축은 RPG 쯔꾸르 MV/MZ 게임에서만 됩니다 (다른 엔진은 파일 형식이 달라 위험).<br>"
+        t += "</p>"
+        if self.e.get("archive") and os.path.isfile(self.e.get("path", "")):
+            try:
+                t += (f"<p>※ 원본 압축파일도 그대로 있습니다 ({H(os.path.getsize(self.e['path']))}). "
+                      "푼 폴더와 둘 다 있으면 용량을 두 번 차지합니다.</p>")
+            except OSError:
+                pass
+        if bk["count"]:
+            t += (f"<p style='background:#fff3cd;color:#5a4500;padding:6px'><b>확인 대기 중</b> ({', '.join(bk['actions'])}) — "
+                  f"바꾼 파일 {bk['count']:,}개, 줄어든 용량 <b>{H(bk['saved'])}</b>.<br>"
+                  f"원본 {H(bk['size'])}은 게임 폴더의 {gs_shrink.BACKUP_DIR} 에 보관 중이라 아직 공간이 비지 않았습니다. "
+                  "게임을 실행해서 장면 몇 개를 확인한 뒤 <b>확정</b>을 누르면 그만큼 비워집니다.</p>")
+        if not self.ffmpeg and c["audio"][0]:
+            t += ("<p>음악 압축에는 ffmpeg가 필요합니다: "
+                  "<a href='https://www.gyan.dev/ffmpeg/builds/'>gyan.dev 윈도우용 ffmpeg</a> "
+                  "(ffmpeg-release-essentials.zip) 을 받아 bin\\ffmpeg.exe 를 GameShelf 폴더에 넣어주세요.</p>")
+        self.info_lbl.setText(t)
+        self.info_lbl.setOpenExternalLinks(True)
+        idle = not self.busy
+        self.b_ll.setEnabled(idle and rpg and c["image"][0] > 0)
+        self.b_hq.setEnabled(idle and rpg and (c["image"][0] + c["image_done"][0]) > 0)
+        self.b_m4a.setEnabled(idle and est["m4a"] > 0)
+        self.b_aud.setEnabled(idle and rpg and bool(self.ffmpeg) and c["audio"][0] > 0)
+        self.b_commit.setEnabled(idle and bk["count"] > 0)
+        self.b_restore.setEnabled(idle and bk["count"] > 0)
+        self.b_share.setEnabled(idle)
+
+    # ------------------------------------------------------------ 작업 실행
+    def start(self, label, fn):
+        if self.busy:
+            return
+        self.busy = True
+        self.stop_flag = False
+        self.prog.setVisible(True)
+        self.prog.setValue(0)
+        self.b_stop.setVisible(True)
+        self.stat.setText(label + "…")
+        self.refresh()
+
+        def work():
+            try:
+                msg = fn()
+            except Exception as ex:
+                msg = f"오류: {type(ex).__name__}: {ex}"
+            self.sig.done.emit(msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def prog_cb(self, i, n, name):
+        self.sig.progress.emit(i, n, name)
+
+    def on_progress(self, i, n, name):
+        self.prog.setMaximum(max(n, 1))
+        self.prog.setValue(i)
+        self.stat.setText(f"{i:,} / {n:,}  {name}")
+
+    def on_done(self, msg):
+        self.busy = False
+        self.win.sync_shrink(self.key, getattr(self, "_committed", 0))
+        self._committed = 0
+        if getattr(self, "_auto_next", False):
+            self._auto_next = False
+            bk = gs_shrink.backup_info(self.folder)
+            if bk["count"] and self.cb_auto.isChecked():
+                self.prog.setVisible(False)
+                self.b_stop.setVisible(False)
+                saved = bk["saved"]
+
+                def fn():
+                    freed = gs_shrink.commit(self.folder, send_to_recycle_bin)
+                    self._committed = saved
+                    return msg.split(" — ")[0] + f" → 바로 확정: 원본 {gs_shrink.human(freed)} 휴지통으로"
+                self.start("백업 지우는 중", fn)
+                return
+        self.prog.setVisible(False)
+        self.b_stop.setVisible(False)
+        self.stat.setText(msg)
+        self.refresh()
+
+    def ask_stop(self):
+        self.stop_flag = True
+        self.stat.setText("멈추는 중… (지금 바꾸던 파일까지만 끝냄)")
+
+    def running_warn(self):
+        return QMessageBox.question(
+            self, "용량 줄이기", "게임이 켜져 있으면 끈 뒤에 진행해주세요.\n계속할까요?") == QMessageBox.Yes
+
+    def run_images(self, mode):
+        if not self.running_warn():
+            return
+        name = "무손실" if mode == "lossless" else "고화질"
+
+        def fn():
+            n, saved, fail = gs_shrink.shrink_images(self.folder, self.info, mode, self.prog_cb, lambda: self.stop_flag)
+            return (f"이미지 {name} 압축: {n:,}개 바꿈, {gs_shrink.human(saved)} 줄어듦"
+                    + (f", 실패 {fail}개(원본 그대로 둠)" if fail else "")
+                    + " — 게임을 실행해서 확인한 뒤 '확정'을 눌러주세요.")
+        self._auto_next = True
+        self.start(f"이미지 {name} 압축 중", fn)
+
+    def run_m4a(self):
+        def fn():
+            n, size = gs_shrink.remove_m4a_dups(self.folder)
+            return f"중복 m4a {n:,}개 ({gs_shrink.human(size)}) 를 백업으로 옮겼습니다."
+        self._auto_next = True
+        self.start("중복 음악 정리 중", fn)
+
+    def run_audio(self):
+        if not self.running_warn():
+            return
+
+        def fn():
+            n, saved, fail = gs_shrink.shrink_audio(self.folder, self.info, self.ffmpeg, self.prog_cb, lambda: self.stop_flag)
+            return f"음악 압축: {n:,}개 바꿈, {gs_shrink.human(saved)} 줄어듦" + (f", 실패 {fail}개" if fail else "")
+        self._auto_next = True
+        self.start("음악 압축 중", fn)
+
+    def do_commit(self):
+        bk = gs_shrink.backup_info(self.folder)
+        if QMessageBox.question(
+                self, "확정",
+                f"게임에서 장면이 잘 나오는 걸 확인하셨나요?\n\n원본 백업 {bk['count']:,}개 ({gs_shrink.human(bk['size'])}) 를 "
+                "휴지통으로 보냅니다.\n휴지통을 비우면 그때 실제로 공간이 비워지고, 비우기 전에는 휴지통에서 되살릴 수 있습니다.") != QMessageBox.Yes:
+            return
+        saved = bk["saved"]
+
+        def fn():
+            freed = gs_shrink.commit(self.folder, send_to_recycle_bin)
+            self._committed = saved
+            return f"확정: 원본 백업 {gs_shrink.human(freed)} 를 휴지통으로 보냈습니다 (휴지통을 비우면 공간이 비워짐). 이 게임 총 절약 {gs_shrink.human(saved)}"
+        self.start("백업 지우는 중", fn)
+
+    def do_restore(self):
+        if QMessageBox.question(self, "되돌리기", "바꾼 파일을 모두 원본으로 되돌릴까요?") != QMessageBox.Yes:
+            return
+        self.start("되돌리는 중", lambda: f"원본 {gs_shrink.restore(self.folder):,}개를 제자리로 돌려놓았습니다.")
+
+    def run_share(self):
+        folders = []
+        for e in self.win.lib["games"].values():
+            d = self.win.game_dir(e)
+            if d and os.path.isdir(d) and rpg_find(d, max_depth=2):
+                folders.append(d)
+        if len(folders) < 2:
+            QMessageBox.information(self, "실행 파일 공유", "압축이 풀린 RPG 쯔꾸르 MV/MZ 게임이 2개 이상 있어야 합니다.")
+            return
+        if QMessageBox.question(
+                self, "실행 파일 공유",
+                f"압축이 풀린 RPG 쯔꾸르 게임 {len(folders):,}개의 실행 프로그램(nw.dll 등)을 비교해서,\n"
+                "내용이 완전히 같은 파일은 디스크에 한 번만 저장되게 합니다 (하드 링크).\n\n"
+                "· 게임 폴더는 겉보기에 그대로이고 게임도 그대로 실행됩니다.\n"
+                "· 탐색기의 폴더 용량 표시는 그대로지만, 드라이브 남은 공간이 늘어납니다.\n"
+                "· 같은 드라이브(NTFS) 안의 게임끼리만 공유됩니다.\n"
+                "· 실행 중인 게임이 있으면 끄고 진행해주세요.\n\n진행할까요?") != QMessageBox.Yes:
+            return
+
+        def fn():
+            r = gs_shrink.dedupe_runtime(folders, self.prog_cb, lambda: self.stop_flag)
+            return (f"실행 파일 공유: {r['linked']:,}개 파일을 공유해서 {gs_shrink.human(r['saved'])} 비웠습니다"
+                    f" (이미 공유 중 {r['already']:,}개" + (f", 건너뜀 {r['errors']:,}개" if r["errors"] else "") + ").")
+        self.start("실행 파일 비교 중", fn)
+
+    def closeEvent(self, ev):
+        if self.busy:
+            QMessageBox.information(self, "용량 줄이기", "작업이 끝날 때까지 기다리거나 '중지'를 눌러주세요.")
+            ev.ignore()
+            return
+        super().closeEvent(ev)
+
+    def reject(self):
+        if self.busy:
+            return
+        super().reject()
 
 
 # ---------------------------------------------------------------- 다시 찾기 창
@@ -1492,8 +2345,9 @@ class SearchDialog(QDialog):
 
 
 # ---------------------------------------------------------------- 메인 창
-FILTERS = ["전체", "정보 찾음", "못 찾음", "숨긴 항목", "폴더 없어짐", "🛡 위험·확인 필요", "🕹 플레이한 게임"]
-SORTS = ["제목순", "추가된 순", "코드순", "제작사순", "최근 플레이순"]
+FILTERS = ["전체", "정보 찾음", "못 찾음", "숨긴 항목", "폴더 없어짐", "🛡 위험·확인 필요", "🕹 플레이한 게임",
+           "💾 용량 줄인 게임", "🏆 클리어한 게임"]
+SORTS = ["제목순", "추가된 순", "코드순", "제작사순", "최근 플레이순", "⭐ 평점순"]
 
 
 class MainWindow(QMainWindow):
@@ -1514,6 +2368,8 @@ class MainWindow(QMainWindow):
         self.sig.engine_scan.connect(self.on_engine_scan)
         self.sig.precheck.connect(self.on_precheck)
         self.sig.extracted.connect(self.on_extracted)
+        self.sig.cheat_msg.connect(lambda m: self.status_lbl.setText(m))
+        self.sig.repacked.connect(self.on_repacked)
         self.extracting = set()
         self.running = []          # [(key, 시작 시각, Popen)]
         self.play_timer = QTimer(self)
@@ -1666,7 +2522,11 @@ class MainWindow(QMainWindow):
                 ("websearch", "웹에서 찾기 ▾", None),
                 ("paste", "📋 복사한 이미지 붙여넣기", lambda: self.paste_cover(self.cur_key)),
                 ("translate", "🈂 한국어 번역 설치", lambda: self.install_translation(self.cur_key)),
-                ("delete", "🗑 게임 삭제", lambda: self.delete_games([self.cur_key]))]):
+                ("shrink", "💾 용량 줄이기…", lambda: self.open_shrink(self.cur_key)),
+                ("rate", "⭐ 평점…", lambda: self.rate_game(self.cur_key)),
+                ("del_game", "🗑 게임 삭제", lambda: self.trash_parts([self.cur_key], {"game"})),
+                ("del_install", "🗑 설치 삭제", lambda: self.trash_parts([self.cur_key], {"install"})),
+                ("del_clear", "🗑 클리어 삭제", lambda: self.trash_parts([self.cur_key], {"clear"}))]):
             b = QPushButton(label)
             if fn:
                 b.clicked.connect(fn)
@@ -1679,6 +2539,9 @@ class MainWindow(QMainWindow):
         pv.addWidget(self.d_cover)
         pv.addWidget(self.d_title)
         pv.addLayout(grid)
+        self.d_rating = QLabel()
+        self.d_rating.setVisible(False)
+        pv.addWidget(self.d_rating)
         pv.addWidget(self.d_info, 1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1699,6 +2562,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.status_lbl, 1)
         self.statusBar().addPermanentWidget(self.prog)
         self.show_detail(None)
+        QTimer.singleShot(1500, self.reconcile_files)
 
     def apply_sizes(self):
         w = self.thumb_w
@@ -1780,14 +2644,57 @@ class MainWindow(QMainWindow):
         p.setPen(QColor("#ffffff"))
         p.drawText(QRectF(6, 6, r, r), Qt.AlignCenter, mark)
 
-    def ph_icon(self, kind, badge=None):
+    def draw_shrink(self, p, w, h, mark):
+        """용량 줄인 게임 표시: 테두리 + 오른쪽 아래 💾 딱지 (확정=청록 실선, 확인 대기=주황 점선)"""
+        if not mark:
+            return
+        col = QColor("#20b2aa" if mark == "done" else "#ff9f1c")
+        p.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(col, 4)
+        if mark == "pending":
+            pen.setStyle(Qt.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(2, 2, w - 4, h - 4), 6, 6)
+        r = max(20, w // 8)
+        box = QRectF(w - r - 6, h - r - 6, r, r)
+        p.setPen(QPen(QColor("#ffffff"), 2))
+        p.setBrush(col)
+        p.drawRoundedRect(box, 5, 5)
+        f = QFont()
+        f.setPixelSize(int(r * 0.6))
+        p.setFont(f)
+        p.drawText(box, Qt.AlignCenter, "💾" if mark == "done" else "⏳")
+
+    def draw_score(self, p, w, h, score):
+        """클리어한 게임: 왼쪽 아래 ★ 합계 딱지"""
+        if score is None:
+            return
+        f = QFont()
+        f.setPixelSize(max(12, w // 13))
+        f.setBold(True)
+        p.setFont(f)
+        txt = f"★ {fmt_score(score)}/20"
+        tw = p.fontMetrics().horizontalAdvance(txt) + 12
+        th = f.pixelSize() + 8
+        box = QRectF(6, h - th - 6, tw, th)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 170))
+        p.drawRoundedRect(box, 6, 6)
+        p.setPen(QColor(STAR_GOLD))
+        p.drawText(box, Qt.AlignCenter, txt)
+
+    def ph_icon(self, kind, badge=None, mark=None, score=None):
         w, h = self.thumb_w, int(self.thumb_w * 0.75)
-        ck = ("icon", kind, w, badge)
+        ck = ("icon", kind, w, badge, mark, score)
         if ck not in self.ph_cache:
             pm = self.placeholder_pixmap(kind, w, h).copy()
-            if badge:
+            if badge or mark or score is not None:
                 p = QPainter(pm)
                 self.draw_badge(p, w, badge)
+                self.draw_shrink(p, w, h, mark)
+                self.draw_score(p, w, h, score)
                 p.end()
             self.ph_cache[ck] = QIcon(pm)
         return self.ph_cache[ck]
@@ -1804,9 +2711,11 @@ class MainWindow(QMainWindow):
         w, h = self.thumb_w, int(self.thumb_w * 0.75)
         cp = self.cover_path(e)
         badge = sec_state(e)
+        mark = shrink_mark(e)
+        score = rating_total(e)
         if cp is None:
-            return self.ph_icon("wait" if e.get("status") in ("new", "pending") else "noimg", badge)
-        ck = (str(cp), os.path.getmtime(cp), w, badge)
+            return self.ph_icon("wait" if e.get("status") in ("new", "pending") else "noimg", badge, mark, score)
+        ck = (str(cp), os.path.getmtime(cp), w, badge, mark, score)
         if ck in self.icon_cache:
             self.icon_cache.move_to_end(ck)
             return self.icon_cache[ck]
@@ -1827,6 +2736,8 @@ class MainWindow(QMainWindow):
         p = QPainter(pm)
         p.drawImage((w - img.width()) // 2, (h - img.height()) // 2, img)
         self.draw_badge(p, w, badge)
+        self.draw_shrink(p, w, h, mark)
+        self.draw_score(p, w, h, score)
         p.end()
         icon = QIcon(pm)
         self.icon_cache[ck] = icon
@@ -1879,14 +2790,17 @@ class MainWindow(QMainWindow):
         out = []
         for key, e in self.lib["games"].items():
             hidden, missing = e.get("hidden"), e.get("missing")
-            if fi == 3:
+            if fi == 8:
+                if not e.get("rating"):
+                    continue
+            elif fi == 3:
                 if not hidden:
                     continue
             elif fi == 4:
                 if not missing:
                     continue
             else:
-                if hidden or missing:
+                if hidden or (missing and not e.get("rating")):     # 클리어한 게임은 파일이 없어도 보임
                     continue
                 if fi == 1 and e.get("status") != "found":
                     continue
@@ -1895,6 +2809,8 @@ class MainWindow(QMainWindow):
                 if fi == 5 and sec_state(e) not in ("red", "yellow"):
                     continue
                 if fi == 6 and not e.get("plays"):
+                    continue
+                if fi == 7 and not shrink_mark(e):
                     continue
             if q:
                 hay = norm(" ".join([display_name(e), e.get("title", ""), e.get("name", ""), e.get("code", ""),
@@ -1911,8 +2827,10 @@ class MainWindow(QMainWindow):
             out.sort(key=lambda x: (x[1].get("code") or "~", norm(x[1].get("title"))))
         elif si == 3:
             out.sort(key=lambda x: (norm(x[1].get("maker")) or "~", norm(x[1].get("title"))))
-        else:
+        elif si == 4:
             out.sort(key=lambda x: x[1].get("last_played", 0), reverse=True)
+        else:
+            out.sort(key=lambda x: (-(rating_total(x[1]) or -1), norm(display_name(x[1]))))
         return out
 
     def item_text(self, e):
@@ -1922,7 +2840,7 @@ class MainWindow(QMainWindow):
     def set_item_icon(self, it, e):
         icon = self.make_icon(e, load=False)
         if icon is None:
-            it.setIcon(self.ph_icon("blank"))
+            it.setIcon(self.ph_icon("blank", None, shrink_mark(e), rating_total(e)))
             it.setData(Qt.UserRole + 1, "blank")
         else:
             it.setIcon(icon)
@@ -1966,6 +2884,13 @@ class MainWindow(QMainWindow):
         g = [e for e in self.lib["games"].values() if not e.get("hidden") and not e.get("missing")]
         found = sum(1 for e in g if e.get("status") == "found")
         txt = f"게임 {len(g)}개 · 정보 찾음 {found} · 못 찾음 {len(g) - found}"
+        cl = sum(1 for e in self.lib["games"].values() if e.get("rating"))
+        if cl:
+            txt += f" · 🏆 클리어 {cl}개"
+        sh = [e for e in g if shrink_mark(e)]
+        if sh:
+            txt += (f" · 💾 용량 줄임 {len(sh)}개 ({gs_shrink.human(sum((e.get('shrink') or {}).get('saved', 0) for e in sh))} 절약"
+                    + (f", 확인 대기 {sum(1 for e in sh if shrink_mark(e) == 'pending')}개" if any(shrink_mark(e) == 'pending' for e in sh) else "") + ")")
         if self.jobs_left:
             txt += f"   |   정보 가져오는 중… 남은 {self.jobs_left}개"
         for k, label in (("def", "Defender"), ("vt", "VirusTotal"), ("vtu", "VT 업로드")):
@@ -1987,6 +2912,22 @@ class MainWindow(QMainWindow):
             return
         self.btns["web"].setEnabled(bool(e.get("url")))
         self.btns["translate"].setEnabled(not e.get("archive") or self.archive_ready(e))
+        gd = self.game_dir(e)
+        self.btns["shrink"].setEnabled(bool(gd) and os.path.isdir(gd))
+        pst = self.parts_state(e)
+        self.btns["del_game"].setEnabled("game" in pst)
+        self.btns["del_install"].setEnabled("install" in pst)
+        self.btns["del_clear"].setEnabled("clear" in pst)
+        for k, part in (("del_game", "game"), ("del_install", "install"), ("del_clear", "clear")):
+            self.btns[k].setToolTip(pst.get(part, "지울 파일이 없습니다"))
+        if e.get("removed"):
+            for k in ("run", "folder", "translate", "shrink"):
+                self.btns[k].setEnabled(False)
+        if e.get("rating"):
+            self.d_rating.setPixmap(rating_pixmap(e["rating"]))
+            self.d_rating.setVisible(True)
+        else:
+            self.d_rating.setVisible(False)
         if e.get("archive"):
             ready = self.archive_ready(e)
             busy = key in self.extracting
@@ -1995,6 +2936,12 @@ class MainWindow(QMainWindow):
         else:
             self.btns["run"].setText("▶ 실행")
             self.btns["run"].setEnabled(bool(e.get("exe")))
+        if not self.play_folder(e) and "clear" in pst and not (e.get("archive") and "install" in pst):
+            self.btns["run"].setText("📦 클리어본 풀기")
+            self.btns["run"].setEnabled(key not in self.extracting)
+        elif e.get("removed"):
+            self.btns["run"].setText("🗑 삭제한 게임")
+            self.btns["run"].setEnabled(False)
         cp = COVER_DIR / e["cover"] if e.get("cover") else None
         pm = QPixmap(str(cp)) if cp and cp.exists() else QPixmap()
         if pm.isNull():
@@ -2025,6 +2972,19 @@ class MainWindow(QMainWindow):
             row("진단", f"<span style='color:#c99'>{esc(e['debug'])}</span>")
         row("폴더 이름", esc(e.get("name", "")))
         row("경로", esc(e.get("path", "")))
+        if e.get("clear_archive"):
+            row("클리어본", esc(e["clear_archive"]))
+        if e.get("removed"):
+            row("파일", f"<span style='color:#c99'>🗑 삭제함 ({fmt_time(e.get('removed_at'))}) — 기록·평점만 남아 있습니다</span>")
+        if e.get("rating"):
+            row("클리어", f"🏆 평점 {fmt_score(rating_total(e))} / 20 ({fmt_time(e['rating'].get('date'))})")
+        sh = e.get("shrink") or {}
+        if shrink_mark(e) == "done":
+            row("용량", f"<span style='color:#20b2aa'>💾 줄임 — {gs_shrink.human(sh.get('saved', 0))} 절약"
+                      f" ({esc(', '.join(sh.get('actions') or []))}, {fmt_time(sh.get('date'))})</span>")
+        elif shrink_mark(e) == "pending":
+            row("용량", f"<span style='color:#ff9f1c'>⏳ 확인 대기 — {gs_shrink.human(sh.get('pending', 0))} 줄어듦, "
+                      "게임 실행으로 확인한 뒤 ‘용량 줄이기’ 창에서 확정해주세요</span>")
         if e.get("plays"):
             row("플레이", f"{e['plays']}회 · 총 {fmt_secs(e.get('play_secs'))} · 마지막 {fmt_time(e.get('last_played'))}")
         sc = e.get("scan") or {}
@@ -2176,12 +3136,15 @@ class MainWindow(QMainWindow):
                     added += 1
                 else:
                     e["missing"] = False
+                    e["removed"] = False
                     e["path"] = path
                     if exe:
                         e["exe"] = exe
             for k, e in games.items():
                 if (k == rk or k.startswith(rk + os.sep)) and k not in seen and k not in ext_keys:
-                    e["missing"] = not os.path.exists(e.get("path", ""))
+                    e["missing"] = not any(os.path.exists(x) for x in (
+                        e.get("path", ""), e.get("extracted", ""), e.get("clear_archive", "")) if x)
+        self.reconcile_files()
         self.schedule_save()
         self.refresh_list()
         self.status_lbl.setText(f"스캔 완료 · 새 게임 {added}개")
@@ -2273,6 +3236,10 @@ class MainWindow(QMainWindow):
         e = self.lib["games"].get(key) if key else None
         if not e:
             return
+        if not self.play_folder(e) and e.get("clear_archive") and os.path.isfile(e["clear_archive"]) and \
+                not (e.get("archive") and os.path.isfile(e.get("path", ""))):
+            self.start_extract(key)          # 처음 받은 압축파일은 지웠고 클리어본만 있음 → 클리어본을 풂
+            return
         if e.get("archive"):
             if not self.archive_ready(e):
                 self.launch_dialog(key)
@@ -2297,6 +3264,8 @@ class MainWindow(QMainWindow):
 
     def launch(self, key, exe):
         e = self.lib["games"][key]
+        if self.lib.get("settings", {}).get("auto_cheat", True):
+            self.auto_cheat(key, exe)
         try:
             pr = subprocess.Popen([exe], cwd=os.path.dirname(exe))
         except Exception as ex:
@@ -2353,12 +3322,12 @@ class MainWindow(QMainWindow):
         e = self.lib["games"].get(key)
         if not e or key in self.extracting:
             return False
-        path = e["path"]
-        if not os.path.isfile(path):
-            QMessageBox.warning(self, "압축 풀기", f"압축파일이 없습니다:\n{path}")
+        src, name, parent = self.extract_source(e)
+        if not src:
+            QMessageBox.warning(self, "압축 풀기", f"압축파일이 없습니다:\n{e.get('path', '')}")
             return False
-        name = os.path.splitext(os.path.basename(path))[0].rstrip(". ")
-        same = os.path.join(os.path.dirname(path), name)
+        path = src
+        same = os.path.join(parent, name)
         if not pw and os.path.isdir(same) and os.listdir(same):
             r = QMessageBox.question(
                 self, "압축 풀기",
@@ -2379,7 +3348,7 @@ class MainWindow(QMainWindow):
 
         def job():
             try:
-                dest, msg = extract_archive(path, pw)
+                dest, msg = extract_archive(path, pw, name, parent)
             except Exception as ex:
                 dest, msg = None, f"|{type(ex).__name__}: {ex}"
             sig.extracted.emit(key, dest or "", msg)
@@ -2412,7 +3381,7 @@ class MainWindow(QMainWindow):
             return
         games = self.lib["games"]
         dk = key_of(dest)
-        dup = games.pop(dk, None)          # 같은 폴더가 따로 게임으로 등록돼 있었으면 합침
+        dup = games.pop(dk, None) if dk != key else None   # 같은 폴더가 따로 게임으로 등록돼 있었으면 합침
         if dup:
             for f in ("plays", "play_secs", "last_played"):
                 if dup.get(f) and not e.get(f):
@@ -2420,12 +3389,22 @@ class MainWindow(QMainWindow):
             it = self.items.pop(dk, None)
             if it is not None:
                 self.listw.takeItem(self.listw.row(it))
-        e["extracted"] = dest
+        if e.get("archive"):
+            e["extracted"] = dest
+        else:
+            e["path"] = dest                # 폴더 게임을 클리어본에서 되살린 경우
         e["exe"] = find_exe(dest)
+        e["removed"] = False
+        e["missing"] = False
+        try:
+            ns = restore_saves(e, dest)
+        except OSError:
+            ns = 0
         self.schedule_save()
         self.update_item(key)
         self.status_lbl.setText(f"📦 압축 풀기 완료 → {dest}" +
-                                ("" if e["exe"] else "  (실행 파일은 못 찾음)"))
+                                ("" if e["exe"] else "  (실행 파일은 못 찾음)") +
+                                (f"  · 보관해 둔 세이브 {ns}개 되돌려 놓음" if ns else ""))
         dlg = self.rand_dlg
         if dlg and dlg.key == key and dlg.state == "extracting":
             dlg.pending_tr = dest          # 번역기 설치는 보안 검사를 통과한 뒤에
@@ -2473,6 +3452,300 @@ class MainWindow(QMainWindow):
         proc = run_translator(dest, auto=True)
         self.status_lbl.setText(self.status_lbl.text() + "  ·  🈂 번역기 자동 설치 중")
         return proc
+
+    def rate_game(self, key, reason=""):
+        """평점 창. 저장하면 '🏆 클리어한 게임'에 들어감. 반환: 저장했으면 True"""
+        e = self.lib["games"].get(key) if key else None
+        if not e:
+            return False
+        dlg = RatingDialog(self, e, reason)
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        if dlg.cleared:
+            e.pop("rating", None)
+        else:
+            e["rating"] = dlg.result_rating()
+        self.schedule_save()
+        self.update_item(key)
+        self.update_status()
+        return True
+
+    def ask_rating(self, key, reason):
+        e = self.lib["games"].get(key)
+        if e and not e.get("rating"):
+            self.rate_game(key, reason)
+
+    def open_shrink(self, key):
+        if key and key in self.lib["games"]:
+            was = shrink_mark(self.lib["games"][key])
+            ShrinkDialog(self, key).exec()
+            self.sync_shrink(key)
+            if was != "done" and shrink_mark(self.lib["games"][key]) == "done":
+                self.ask_rating(key, "용량 줄이기를 마쳤습니다. 다 한 게임이라면 평점을 남겨 보세요.")
+            self.offer_drop_archive(key)
+
+    def extract_source(self, e):
+        """압축 풀 때 쓸 파일: 처음 받은 압축파일이 있으면 그것, 없으면 클리어본. 반환: (파일, 풀 폴더 이름, 위치)"""
+        if e.get("archive"):
+            base = e.get("path", "")
+            name = os.path.splitext(os.path.basename(base))[0].rstrip(". ")
+            parent = os.path.dirname(base)
+            if os.path.isfile(base):
+                return base, name, parent
+        else:
+            base = e.get("path", "")
+            name, parent = os.path.basename(base.rstrip("\\/")), os.path.dirname(base.rstrip("\\/"))
+        ca = e.get("clear_archive", "")
+        if ca and os.path.isfile(ca):
+            return ca, name, parent
+        return "", name, parent
+
+    def play_folder(self, e):
+        """지금 플레이하는 폴더 (압축 게임이면 푼 폴더, 폴더 게임이면 그 폴더). 없으면 \"\""""
+        if e.get("archive"):
+            return e["extracted"] if self.archive_ready(e) else ""
+        p = e.get("path", "")
+        return p if p and os.path.isdir(p) else ""
+
+    def clear_archive_path(self, e):
+        folder = self.play_folder(e)
+        base = e.get("path", "") if e.get("archive") else folder
+        stem = os.path.splitext(os.path.basename(base))[0] if e.get("archive") else os.path.basename(folder.rstrip("\\/"))
+        kind, _ = find_archiver(prefer="7z")
+        ext = ".7z" if kind else ".zip"
+        old = e.get("clear_archive", "")
+        if old and os.path.splitext(old)[1].lower() == ext:
+            return old
+        return os.path.join(os.path.dirname(base.rstrip("\\/")), stem + CLEAR_TAG + ext)
+
+    def offer_drop_archive(self, key):
+        """용량 줄이기를 확정한 게임: 세이브까지 담은 클리어본 압축파일을 따로 만들지 물어봄 (원본은 그대로)"""
+        e = self.lib["games"].get(key)
+        if not e or shrink_mark(e) != "done" or not self.play_folder(e):
+            return
+        if e.get("clear_at", 0) >= (e.get("shrink") or {}).get("date", 0):
+            return
+        target = self.clear_archive_path(e)
+        if QMessageBox.question(
+                self, "클리어본 만들기",
+                f"{display_name(e)}\n\n용량을 줄인 게임 폴더를 세이브까지 통째로 압축해서 클리어본을 따로 만들까요?\n\n"
+                f"새로 만들 파일: {target}\n\n"
+                "처음 받은 압축파일과 지금 플레이하던 폴더는 그대로 둡니다. 다 만든 뒤에 오른쪽 버튼으로 따로 지우면 됩니다.\n"
+                "· 게임 삭제 = 플레이하던 폴더\n· 설치 삭제 = 처음 받은 압축파일\n· 클리어 삭제 = 클리어본") != QMessageBox.Yes:
+            return
+        self.start_repack(key)
+
+    def repack_menu(self, key):
+        e = self.lib["games"].get(key)
+        folder = self.play_folder(e) if e else ""
+        if not folder:
+            return
+        if os.path.isdir(os.path.join(folder, gs_shrink.BACKUP_DIR)):
+            QMessageBox.information(self, "클리어본 만들기", "용량 줄이기가 확인 대기 중입니다. 먼저 '용량 줄이기' 창에서 확정해주세요.")
+            return
+        target = self.clear_archive_path(e)
+        saves = find_save_dirs(folder)
+        if QMessageBox.question(
+                self, "클리어본 만들기",
+                f"{display_name(e)}\n\n지금 게임 폴더를 세이브까지 통째로 압축해서 클리어본을 만듭니다.\n"
+                f"· 폴더: {folder}\n· 세이브 폴더: {len(saves)}개\n· 만들 파일: {target}\n\n"
+                + ("이미 클리어본이 있으면 최신 세이브로 새로 만들고, 이전 클리어본은 휴지통으로 보냅니다.\n"
+                   if os.path.isfile(target) else "")
+                + "처음 받은 압축파일은 건드리지 않습니다. 게임이 켜져 있으면 끄고 진행해주세요. 진행할까요?") != QMessageBox.Yes:
+            return
+        self.start_repack(key)
+
+    def start_repack(self, key, then=""):
+        """클리어본(줄인 폴더 + 세이브) 압축파일 만들기 (백그라운드). 처음 받은 압축파일은 건드리지 않음"""
+        e = self.lib["games"].get(key)
+        folder = self.play_folder(e) if e else ""
+        if not folder:
+            return
+        self.repacking = getattr(self, "repacking", set())
+        if key in self.repacking:
+            return
+        self.repacking.add(key)
+        target = self.clear_archive_path(e)
+        try:
+            backup_saves(e, folder)
+        except OSError:
+            pass
+        sig = self.sig
+        self.status_lbl.setText(f"📦 {display_name(e)}: 클리어본 만드는 중… (세이브 포함)")
+
+        def job():
+            try:
+                size, old = repack_archive(folder, target)
+                if old:                     # 이전 클리어본은 새 파일 확인 후 휴지통으로
+                    stem, ext = os.path.splitext(target)
+                    named = f"{stem} 이전 {time.strftime('%Y%m%d_%H%M')}{ext}"
+                    try:
+                        os.replace(old, named)
+                        old = named
+                    except OSError:
+                        pass
+                    send_to_recycle_bin(old)
+                sig.repacked.emit(key, "", f"{then}|{size}|{target}")
+            except Exception as err:
+                sig.repacked.emit(key, f"{type(err).__name__}: {err}", then)
+        self.pool.start(FuncTask(job))
+
+    def on_repacked(self, key, err, info):
+        self.repacking.discard(key)
+        e = self.lib["games"].get(key)
+        if not e:
+            return
+        parts = info.split("|")
+        then = parts[0]
+        if err:
+            self.status_lbl.setText("📦 클리어본 만들기 실패")
+            QMessageBox.warning(self, "클리어본 만들기", f"{display_name(e)}\n\n{err}\n\n원래 파일들은 그대로입니다.")
+            return
+        size, target = int(parts[1] or 0), parts[2]
+        e["clear_archive"] = target
+        e["clear_at"] = time.time()
+        self.schedule_save()
+        self.update_item(key)
+        self.status_lbl.setText(f"📦 {display_name(e)}: 클리어본을 만들었습니다 ({gs_shrink.human(size)}) — {target}")
+        if then == "trash_game":
+            self.trash_parts([key], {"game"}, confirmed=True)
+
+    def relink_to_folder(self, key):
+        """압축 게임 항목을 '폴더 게임'으로 바꿈 (플레이 기록·표지·정보는 그대로)"""
+        games = self.lib["games"]
+        e = games.get(key)
+        if not e or not e.get("extracted"):
+            return key
+        folder = e["extracted"]
+        nk = key_of(folder)
+        dup = games.pop(nk, None) if nk != key else None
+        if dup:
+            for f in ("plays", "play_secs", "last_played"):
+                if dup.get(f) and not e.get(f):
+                    e[f] = dup[f]
+        games.pop(key, None)
+        e["path"] = folder
+        e.pop("archive", None)
+        e.pop("extracted", None)
+        if not e.get("exe") or not os.path.isfile(e["exe"]):
+            e["exe"] = find_exe(folder)
+        games[nk] = e
+        self.cur_key = nk
+        self.schedule_save()
+        self.refresh_list()
+        if nk in self.items:
+            self.listw.setCurrentItem(self.items[nk])
+        self.show_detail(nk)
+        self.status_lbl.setText(f"💾 {display_name(e)}: 원본 압축파일을 정리하고 {folder} 로 연결했습니다.")
+        return nk
+
+    def sync_shrink(self, key, committed=0):
+        """게임 폴더의 백업 상태를 읽어 목록 표시(테두리·딱지)를 맞춤"""
+        e = self.lib["games"].get(key)
+        if not e:
+            return
+        d = self.game_dir(e)
+        sh = dict(e.get("shrink") or {})
+        bi = gs_shrink.backup_info(d) if d and os.path.isdir(d) else {"count": 0, "saved": 0, "actions": []}
+        if committed:
+            sh["saved"] = sh.get("saved", 0) + committed
+            sh["state"] = "done"
+            sh["date"] = time.time()
+        for a in bi.get("actions") or []:
+            sh.setdefault("actions", [])
+            if a not in sh["actions"]:
+                sh["actions"].append(a)
+        if bi["count"]:
+            sh["state"] = "pending"
+            sh["pending"] = bi["saved"]
+        else:
+            sh.pop("pending", None)
+            sh["state"] = "done" if sh.get("saved") else None
+        old = e.get("shrink")
+        if sh.get("state"):
+            e["shrink"] = sh
+        else:
+            e.pop("shrink", None)
+        if old != e.get("shrink"):
+            self.schedule_save()
+            self.update_item(key)
+            self.update_status()
+
+    def auto_cheat(self, key, exe):
+        """RPG 쯔꾸르 MV/MZ 게임을 실행할 때 치트가 없으면 넣고, 있으면 최신 파일로 바꿈 (실패해도 실행은 그대로)"""
+        try:
+            d = os.path.dirname(exe)
+            info = rpg_find(d, max_depth=2)
+            if not info or not CHEAT_JS.is_file():
+                return
+            target = info[0] / "plugins" / "GS_Cheat.js"
+            if cheat_installed(info):
+                if target.read_bytes() != CHEAT_JS.read_bytes():
+                    shutil.copyfile(CHEAT_JS, target)
+                if (info[0] / "plugins" / "GS_Cheat_ko.json").is_file():
+                    return
+            else:
+                install_cheat(d)
+                self.lib["games"][key]["cheat"] = True
+            self.start_cheat_dict(d, display_name(self.lib["games"][key]))
+        except Exception as ex:
+            dbg(f"치트 자동 설치 실패: {ex}")
+
+    def start_cheat_dict(self, folder, title):
+        def work():
+            try:
+                total, miss = build_cheat_dict(folder)
+                msg = f"🎮 {title}: 치트 창 이름 번역 {total - miss}/{total}개"
+                if miss and Translator.status:
+                    msg += f" — {Translator.status}"
+            except Exception as ex:
+                msg = f"🎮 치트 이름 번역 실패: {type(ex).__name__}: {ex}"
+            self.sig.cheat_msg.emit(msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def cheat_install(self, key):
+        e = self.lib["games"].get(key) if key else None
+        d = self.game_dir(e) if e else ""
+        if not d:
+            QMessageBox.information(self, "치트", "압축을 먼저 풀어주세요.")
+            return
+        try:
+            js, data, kind = install_cheat(d)
+        except CheatError as ex:
+            QMessageBox.information(self, "치트", str(ex))
+            return
+        except OSError as ex:
+            QMessageBox.warning(self, "치트", f"파일을 쓰지 못했습니다 (게임이 실행 중이거나 권한 문제):\n{ex}")
+            return
+        e["cheat"] = True
+        self.schedule_save()
+        self.start_cheat_dict(d, display_name(e))
+        self.status_lbl.setText(f"🎮 치트 설치됨 (RPG 쯔꾸르 {kind}) — 이름 번역 중…")
+        QMessageBox.information(
+            self, "치트 설치 완료",
+            f"RPG 쯔꾸르 {kind} 게임에 치트를 넣었습니다.\n\n"
+            "게임 안에서  `  키 (숫자 1 왼쪽, Esc 아래) = 치트 창 열기/닫기\n"
+            "Shift + `  = 아이템 사이드바\n\n"
+            "아이템·맵 이름의 한국어 번역은 지금 백그라운드에서 만들고 있고,\n"
+            "게임 실행 중에 끝나도 치트 창을 다시 열면 반영됩니다.\n\n"
+            f"원래 plugins.js는 {js / 'plugins.js.gs_backup'} 로 백업했습니다.")
+
+    def cheat_remove(self, key):
+        e = self.lib["games"].get(key) if key else None
+        d = self.game_dir(e) if e else ""
+        if not d:
+            return
+        try:
+            uninstall_cheat(d)
+        except (CheatError, OSError) as ex:
+            QMessageBox.warning(self, "치트 제거", str(ex))
+            return
+        e["cheat"] = False
+        st = self.lib.setdefault("settings", {})
+        self.schedule_save()
+        note = ("\n\n※ '게임 실행 시 치트 자동 설치'가 켜져 있어서 다음 실행 때 다시 들어갑니다. "
+                "⚙설정에서 끌 수 있습니다." if st.get("auto_cheat", True) else "")
+        QMessageBox.information(self, "치트 제거", "치트를 뺐습니다." + note)
 
     def open_web(self, key):
         e = self.lib["games"].get(key) if key else None
@@ -2591,6 +3864,19 @@ class MainWindow(QMainWindow):
             m.addAction("위치 열기", lambda: self.open_folder(key))
             a = m.addAction("🈂 한국어 번역 설치 / 점검", lambda: self.install_translation(key))
             a.setEnabled(not ge.get("archive") or self.archive_ready(ge))
+            gd = self.game_dir(ge)
+            ri = rpg_find(gd) if gd else None
+            if ri:
+                if cheat_installed(ri):
+                    m.addAction("🎮 치트 다시 넣기 · 이름 다시 번역", lambda: self.cheat_install(key))
+                    m.addAction("🎮 치트 빼기", lambda: self.cheat_remove(key))
+                else:
+                    m.addAction(f"🎮 치트 넣기 (RPG 쯔꾸르 {ri[2]}, 게임 안에서 ` 키)", lambda: self.cheat_install(key))
+            if self.play_folder(ge):
+                m.addAction("📦 클리어본 만들기" if not ge.get("clear_archive") else "📦 클리어본 새로 만들기",
+                            lambda: self.repack_menu(key))
+            a = m.addAction("💾 용량 줄이기…", lambda: self.open_shrink(key))
+            a.setEnabled(bool(gd) and os.path.isdir(gd))
             a = m.addAction("웹페이지 열기", lambda: self.open_web(key))
             a.setEnabled(bool(self.lib["games"][key].get("url")))
             m.addSeparator()
@@ -2611,7 +3897,14 @@ class MainWindow(QMainWindow):
             m.addAction("원래 이름으로 되돌리기…", lambda: self.rename_folders(keys, revert=True))
         m.addSeparator()
         m.addSeparator()
-        m.addAction(f"🗑 게임 삭제 ({len(keys)}개, 휴지통으로)", lambda: self.delete_games(keys))
+        n = len(keys)
+        cnt = {p: sum(1 for k in keys if p in self.parts_state(self.lib["games"][k])) for p in ("game", "install", "clear")}
+        for part in ("game", "install", "clear"):
+            a = m.addAction(f"🗑 {self.PART_NAME[part]}" + (f" {cnt[part]}개" if n > 1 else ""),
+                            lambda part=part: self.trash_parts(keys, {part}))
+            a.setEnabled(cnt[part] > 0)
+        if n == 1 and not self.parts_state(self.lib["games"][key]):
+            m.addAction("✖ 목록에서 지우기", lambda: self.forget_game(key))
         hidden = self.lib["games"][key].get("hidden")
         m.addAction("숨김 해제" if hidden else f"목록에서 숨기기 ({len(keys)}개)",
                     lambda: self.toggle_hidden(keys, not hidden))
@@ -2885,8 +4178,11 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QCheckBox
         cb_tr = QCheckBox("압축을 풀면 한국어 번역기(GameTranslator)를 바로 이어서 설치 (번역기 툴이 20MB 이하일 때)")
         cb_tr.setChecked(st.get("auto_translate", True))
+        cb_ch = QCheckBox("RPG 쯔꾸르 MV/MZ 게임을 실행할 때 치트(게임 안에서 ` 키)를 자동으로 넣기")
+        cb_ch.setChecked(st.get("auto_cheat", True))
         v.addWidget(QLabel(""))
         v.addWidget(cb_tr)
+        v.addWidget(cb_ch)
         v.addStretch(1)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.button(QDialogButtonBox.Ok).setText("저장")
@@ -2906,6 +4202,7 @@ class MainWindow(QMainWindow):
         st["local_model"] = cb_model.currentText().strip()
         st["vt_key"] = ed_vt.text().strip()
         st["auto_translate"] = cb_tr.isChecked()
+        st["auto_cheat"] = cb_ch.isChecked()
         Translator.configure(st)
         write_gt_engine(st)
         self.update_bridge()
@@ -3242,8 +4539,11 @@ class MainWindow(QMainWindow):
         def jump(k):
             if k not in games:
                 return
+            e = games[k]
             self.search.clear()
-            self.filter_cb.setCurrentIndex(0)
+            # 전체에 안 보이는 게임이면 보이는 필터로 (숨김 / 클리어 / 폴더 없어짐)
+            fi = 3 if e.get("hidden") else 0 if not e.get("missing") or e.get("rating") else 4
+            self.filter_cb.setCurrentIndex(fi)
             self.refresh_list()
             if k in self.items:
                 self.listw.setCurrentItem(self.items[k])
@@ -3268,46 +4568,193 @@ class MainWindow(QMainWindow):
         v.addWidget(bb)
         dlg.exec()
 
+    def reconcile_files(self):
+        """디스크의 실제 파일과 목록을 맞춤:
+        · '이름_클리어본.7z' 이 있으면 클리어본으로 연결
+        · 압축 게임의 푼 폴더가 따로 '폴더 게임'으로 잡혔으면 하나로 합침
+        · 휴지통에서 되살린 파일이 있으면 '삭제함' 표시를 풂
+        · 예전 버전(압축파일 다시 만들기)이 원본 자리에 클리어본을 만들었던 경우 이름을 바로잡을지 물어봄"""
+        games = self.lib["games"]
+        changed, legacy = False, []
+        for k, e in list(games.items()):
+            if k not in games or not e.get("archive"):
+                continue
+            arc = e.get("path", "")
+            d = os.path.dirname(arc)
+            stem, ext = os.path.splitext(os.path.basename(arc))
+            if e.get("repacked_at") and os.path.isfile(arc):
+                olds = sorted(glob.glob(os.path.join(glob.escape(d), glob.escape(stem) + " (이전 압축파일 *)" + ext)))
+                if olds and not os.path.exists(os.path.join(d, stem + CLEAR_TAG + ext)):
+                    legacy.append((k, arc, olds[-1], os.path.join(d, stem + CLEAR_TAG + ext)))
+            for cext in (".7z", ".zip"):
+                c = os.path.join(d, stem + CLEAR_TAG + cext)
+                if os.path.isfile(c) and e.get("clear_archive") != c:
+                    e["clear_archive"] = c
+                    e.setdefault("clear_at", os.path.getmtime(c))
+                    changed = True
+            if not (e.get("extracted") and os.path.isdir(e["extracted"])):
+                f = os.path.join(d, stem.rstrip(". "))
+                fk = key_of(f)
+                fe = games.get(fk)
+                if os.path.isdir(f) and fe is not None and fe is not e and not fe.get("archive"):
+                    games.pop(fk)
+                    e["plays"] = (e.get("plays") or 0) + (fe.get("plays") or 0)
+                    e["play_secs"] = (e.get("play_secs") or 0) + (fe.get("play_secs") or 0)
+                    e["last_played"] = max(e.get("last_played") or 0, fe.get("last_played") or 0)
+                    for x in ("plays", "play_secs", "last_played"):
+                        if not e.get(x):
+                            e.pop(x, None)
+                    e["extracted"] = f
+                    e["exe"] = fe.get("exe") if fe.get("exe") and os.path.isfile(fe["exe"]) else find_exe(f)
+                    if self.cur_key == fk:
+                        self.cur_key = k
+                    changed = True
+            if (e.get("removed") or e.get("missing")) and self.parts_state(e):
+                e["removed"] = False
+                e["missing"] = False
+                changed = True
+        for k, arc, old, clear in legacy:
+            e = games.get(k)
+            try:
+                a1, a2 = gs_shrink.human(os.path.getsize(arc)), gs_shrink.human(os.path.getsize(old))
+            except OSError:
+                continue
+            if QMessageBox.question(
+                    self, "압축파일 이름 바로잡기",
+                    f"{display_name(e)}\n\n예전 버전의 '압축파일 다시 만들기'로 이름이 뒤바뀐 파일이 있습니다.\n\n"
+                    f"· {os.path.basename(arc)} ({a1}) = 용량 줄인 게임 + 세이브 → 클리어본\n"
+                    f"· {os.path.basename(old)} ({a2}) = 처음 받은 원본\n\n"
+                    f"이렇게 이름을 바꿀까요? (지우는 파일 없이 이름만 바꿉니다)\n"
+                    f"· {os.path.basename(arc)} → {os.path.basename(clear)}\n"
+                    f"· {os.path.basename(old)} → {os.path.basename(arc)}") != QMessageBox.Yes:
+                continue
+            try:
+                os.rename(arc, clear)
+                os.rename(old, arc)
+            except OSError as err:
+                QMessageBox.warning(self, "압축파일 이름 바로잡기", f"이름을 바꾸지 못했습니다:\n{err}")
+                continue
+            e["clear_archive"] = clear
+            e["clear_at"] = e.pop("repacked_at", None) or time.time()
+            e["removed"] = False
+            e["missing"] = False
+            changed = True
+        for e in games.values():
+            if e.get("repacked_at") and not e.get("archive"):
+                e.pop("repacked_at", None)
+        if changed:
+            self.schedule_save()
+            self.refresh_list()
+            if self.cur_key in games:
+                self.show_detail(self.cur_key)
+            self.update_status()
+
+    def parts_state(self, e):
+        """지울 수 있는 것: game(플레이 폴더) / install(처음 받은 압축파일) / clear(클리어본)"""
+        st = {}
+        pf = self.play_folder(e)
+        if pf:
+            st["game"] = pf
+        if e.get("archive") and os.path.isfile(e.get("path", "")):
+            st["install"] = e["path"]
+        ca = e.get("clear_archive", "")
+        if ca and os.path.isfile(ca):
+            st["clear"] = ca
+        return st
+
     def delete_games(self, keys):
+        """예전 이름 호환: 게임 삭제 = 플레이하던 폴더"""
+        self.trash_parts(keys, {"game"})
+
+    def forget_game(self, key):
+        e = self.lib["games"].get(key)
+        if not e:
+            return
+        if QMessageBox.question(self, "목록에서 지우기",
+                                f"{display_name(e)}\n\n목록에서 기록·평점까지 완전히 지울까요? (파일은 건드리지 않습니다)") \
+                != QMessageBox.Yes:
+            return
+        c = e.get("cover")
+        if c and not any(x is not e and x.get("cover") == c for x in self.lib["games"].values()):
+            (COVER_DIR / c).unlink(missing_ok=True)
+        self.lib["games"].pop(key, None)
+        if self.cur_key == key:
+            self.cur_key = None
+        self.schedule_save()
+        self.refresh_list()
+
+    PART_NAME = {"game": "게임 삭제", "install": "설치 삭제", "clear": "클리어 삭제"}
+
+    def trash_parts(self, keys, parts, confirmed=False):
+        """게임 삭제(플레이 폴더) · 설치 삭제(처음 받은 압축파일) · 클리어 삭제(클리어본) — 전부 휴지통으로.
+        목록에는 기록·표지·평점이 남음."""
         games = self.lib["games"]
         keys = [k for k in keys if k in games]
         if not keys:
             return
         if self.deleting:
-            QMessageBox.information(self, "게임 삭제", "이전 삭제 작업이 아직 진행 중입니다.")
+            QMessageBox.information(self, "삭제", "이전 삭제 작업이 아직 진행 중입니다.")
             return
         roots = {key_of(r) for r in self.lib["roots"]}
-        bad = [games[k]["path"] for k in keys if key_of(games[k]["path"]) in roots]
-        if bad:
-            QMessageBox.warning(self, "게임 삭제", "등록한 최상위 폴더 자체는 삭제할 수 없습니다:\n" + "\n".join(bad))
+        jobs, lines = [], []
+        for k in keys:
+            e = games[k]
+            st = self.parts_state(e)
+            todo = [(p, st[p]) for p in ("game", "install", "clear") if p in parts and p in st]
+            todo = [(p, path) for p, path in todo if key_of(path) not in roots]
+            if todo:
+                jobs.append((k, todo))
+                lines.append(f"• {display_name(e)}\n" + "\n".join(f"   {self.PART_NAME[p]}: {path}" for p, path in todo))
+        if not jobs:
+            QMessageBox.information(self, "삭제", "지울 파일이 없습니다.")
             return
-        names = "\n".join(f"• {display_name(games[k])}\n   {games[k]['path']}" for k in keys[:8])
-        if len(keys) > 8:
-            names += f"\n… 외 {len(keys) - 8}개"
-        box = QMessageBox(QMessageBox.Warning, "게임 삭제",
-                          f"게임 {len(keys)}개를 삭제합니다.\n"
-                          "폴더(또는 압축파일과 압축 푼 폴더)를 휴지통으로 보내고 목록에서도 지웁니다.\n"
-                          "휴지통에서 되살릴 수 있습니다.\n\n" + names, parent=self)
-        ok_btn = box.addButton("휴지통으로 삭제", QMessageBox.DestructiveRole)
-        box.addButton("취소", QMessageBox.RejectRole)
-        box.exec()
-        if box.clickedButton() is not ok_btn:
-            return
-        items = [(k, [games[k]["path"]] + ([games[k]["extracted"]] if games[k].get("extracted") else []))
-                 for k in keys]
+        title = " · ".join(self.PART_NAME[p] for p in ("game", "install", "clear") if p in parts)
+        if not confirmed:
+            names = "\n".join(lines[:8]) + (f"\n… 외 {len(lines) - 8}개" if len(lines) > 8 else "")
+            box = QMessageBox(QMessageBox.Warning, title,
+                              f"{len(jobs)}개 게임에서 아래 파일을 휴지통으로 보냅니다. 휴지통에서 되살릴 수 있습니다.\n"
+                              "목록에는 기록·표지·평점이 남습니다.\n\n" + names, parent=self)
+            ok_btn = box.addButton("휴지통으로", QMessageBox.DestructiveRole)
+            box.addButton("취소", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is not ok_btn:
+                return
+            if len(jobs) == 1:
+                self.ask_rating(jobs[0][0], f"{title}를 합니다. 다 한 게임이라면 평점을 남겨 보세요.")
+            # 게임 삭제인데 클리어본이 있으면: 그 뒤에 더 한 세이브를 클리어본에 먼저 넣음
+            if len(jobs) == 1 and [p for p, _ in jobs[0][1]] == ["game"]:
+                e = games[jobs[0][0]]
+                if e.get("clear_archive") and os.path.isfile(e["clear_archive"]) and \
+                        shrink_mark(e) == "done" and find_save_dirs(jobs[0][1][0][1]):
+                    if QMessageBox.question(self, "게임 삭제",
+                                            "클리어본이 있습니다. 지우기 전에 지금 세이브로 클리어본을 새로 만들까요?\n"
+                                            "(그 뒤에 플레이한 내용까지 클리어본에 남습니다)") == QMessageBox.Yes:
+                        self.start_repack(jobs[0][0], then="trash_game")
+                        return
+        for k, todo in jobs:
+            if any(p == "game" for p, _ in todo):
+                try:
+                    backup_saves(games[k], dict(todo)["game"])
+                except OSError as err:
+                    QMessageBox.warning(self, title, f"{display_name(games[k])}: 세이브를 보관하지 못해서 멈췄습니다:\n{err}")
+                    return
         self.deleting = True
-        self.status_lbl.setText(f"삭제 중… 0 / {len(items)}")
+        self._del_mode = getattr(self, "_del_mode", {})
+        for k, todo in jobs:
+            self._del_mode[k] = [p for p, _ in todo]
+        self.status_lbl.setText(f"{title} 중… 0 / {len(jobs)}")
         sig = self.sig
 
         def job():
-            for k, paths in items:
-                try:
-                    for path in paths:
+            for k, todo in jobs:
+                errs = []
+                for p, path in todo:
+                    try:
                         if os.path.exists(path):
                             send_to_recycle_bin(path)
-                    sig.deleted.emit(k, "")
-                except Exception as ex:
-                    sig.deleted.emit(k, str(ex))
+                    except Exception as ex:
+                        errs.append(f"{self.PART_NAME[p]}: {ex}")
+                sig.deleted.emit(k, "; ".join(errs))
             sig.deleted.emit("", "END")
 
         self.pool.start(FuncTask(job))
@@ -3318,25 +4765,30 @@ class MainWindow(QMainWindow):
             fails = getattr(self, "_del_fails", [])
             self._del_fails = []
             self.refresh_list()
-            self.status_lbl.setText("삭제 완료" + (f" (실패 {len(fails)}개)" if fails else ""))
+            self.status_lbl.setText("휴지통으로 보냄" + (f" (실패 {len(fails)}개)" if fails else ""))
             if fails:
                 QMessageBox.warning(self, "일부 삭제 실패", "\n".join(fails[:15]))
             return
         e = self.lib["games"].get(key)
+        self._del_mode.pop(key, None)
         if err:
             self._del_fails = getattr(self, "_del_fails", []) + [f"{e and display_name(e)}: {err}"]
+        if not e:
             return
-        if e:
-            c = e.get("cover")
-            if c and not any(x is not e and x.get("cover") == c for x in self.lib["games"].values()):
-                (COVER_DIR / c).unlink(missing_ok=True)
-            self.lib["games"].pop(key, None)
-            if self.cur_key == key:
-                self.cur_key = None
-            it = self.items.pop(key, None)
-            if it is not None:
-                self.listw.takeItem(self.listw.row(it))
-            self.schedule_save()
+        if e.get("archive") and e.get("extracted") and not os.path.isdir(e["extracted"]):
+            e.pop("extracted", None)
+        if e.get("clear_archive") and not os.path.isfile(e["clear_archive"]):
+            e.pop("clear_archive", None)
+            e.pop("clear_at", None)
+        if not self.play_folder(e):
+            e["exe"] = ""
+        left = self.parts_state(e)
+        if not left:                        # 파일이 하나도 안 남음 → 기록만 (평점 있으면 '🏆 클리어한 게임')
+            e["removed"] = True
+            e["removed_at"] = time.time()
+            e["missing"] = True
+        self.schedule_save()
+        self.update_item(key)
 
     def sec_run(self, mode, keys=None, force=False):
         games = self.lib["games"]

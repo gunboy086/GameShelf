@@ -8,7 +8,7 @@ $here = $PSScriptRoot
 Set-Location -LiteralPath $here
 
 Write-Host '[1/3] GameShelf.exe 만드는 중...'
-python -m pip install --quiet PySide6 requests pyinstaller
+python -m pip install --quiet PySide6 requests pillow pyinstaller
 $iconArgs = @()
 if (Test-Path -LiteralPath (Join-Path $here 'GameShelf.ico')) {
     $iconArgs = @('--icon', (Join-Path $here 'GameShelf.ico'), '--add-data', ((Join-Path $here 'GameShelf.ico') + ';.'))
@@ -23,6 +23,7 @@ if (Test-Path -LiteralPath (Join-Path $here 'release')) { Remove-Item -LiteralPa
 New-Item -ItemType Directory -Path $stage | Out-Null
 Copy-Item -LiteralPath $exe -Destination $stage
 Copy-Item -LiteralPath (Join-Path $here 'GameTranslator') -Destination $stage -Recurse
+if (Test-Path -LiteralPath (Join-Path $here 'GameCheat')) { Copy-Item -LiteralPath (Join-Path $here 'GameCheat') -Destination $stage -Recurse }
 foreach ($f in @('읽어주세요.txt', 'LICENSE', 'licenses')) {
     $p = Join-Path $here $f
     if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $stage -Recurse }

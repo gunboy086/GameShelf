@@ -6,8 +6,8 @@ where python >nul 2>nul || (
   pause
   exit /b
 )
-python -c "import PySide6, requests" 2>nul || (
+python -c "import PySide6, requests, PIL.features as f; assert f.check('webp')" 2>nul || (
   echo First run: installing required libraries...
-  python -m pip install PySide6 requests
+  python -m pip install PySide6 requests pillow
 )
 start "" pythonw "%~dp0GameShelf.py"

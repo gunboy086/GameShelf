@@ -4,7 +4,7 @@
 1. 이 폴더를 원하는 곳에 둡니다. (경로에 한글이 없는 곳 추천, 예: D:\Tools\GameShelf)
 2. GameShelf.exe 실행
    - 'Windows의 PC 보호' 창이 뜨면 '추가 정보' → '실행'
-   - GameTranslator 폴더는 GameShelf.exe 옆에 그대로 두세요.
+   - GameTranslator, GameCheat 폴더는 GameShelf.exe 옆에 그대로 두세요.
 3. 왼쪽 위 '폴더 추가' → 게임이 들어 있는 폴더 선택
 4. (선택) '설정'에서 VirusTotal 키 · 번역 엔진 · DeepL/Papago 키 · 내 PC AI 설정
 
@@ -13,12 +13,17 @@
 - Unity(Mono): 실시간 번역 (BepInEx + XUnity.AutoTranslator)
 - RPG Maker MV/MZ: 대사·메뉴 번역 (원본은 data_GTbackup 에 백업)
 - 번역 엔진: Google · Bing · Papago · DeepL · 내 PC AI(Ollama / LM Studio)
+- RPG Maker MV/MZ 치트: 게임을 실행하면 자동으로 들어감. 게임 안에서 ` 키 (숫자 1 왼쪽)
+  · 능력치/레벨/돈, 변수·스위치, 전투 결과 예약(승리·패배·도망), 이동 속도, 벽 통과, 순간이동
+  · Shift + ` = 아이템·무기·방어구·중요 아이템 사이드바
+  · 빼려면 게임 오른쪽 클릭 → '치트 빼기', 자동으로 넣기 싫으면 설정에서 끄기
 
 [주의]
 - 바이러스 검사는 참고용입니다. 안 걸려도 100% 안전하다는 뜻은 아닙니다.
 - 'VirusTotal에 올려서 검사'로 올린 파일은 보안 회사들이 볼 수 있습니다.
 - 번역할 때 제목·대사가 고른 번역 서비스로 전송됩니다. (내 PC AI는 전송 안 됨)
 - Unity 게임 번역은 게임 경로에 한글/일본어가 있으면 동작하지 않습니다.
+- 치트는 세이브 파일에 영향을 줍니다. 중요한 세이브는 미리 복사해 두세요.
 - 7z 게임을 풀려면 반디집 또는 7-Zip 이 필요합니다.
 - 사용하면서 생기는 GameShelf_data 폴더(게임 목록·API 키)는 다른 사람에게 주지 마세요.
 
